@@ -15,12 +15,14 @@ public:
     size_t offset() const { return offset_; }
 
     size_t numel() const;
-    
-    DType dtype();
 
     TensorImpl(std::shared_ptr<Storage> storage,
                const std::vector<int64_t>& shape,
                DType dtype);
+
+    TensorImpl(std::shared_ptr<Storage> storage,
+               const std::vector<int64_t>& shape,
+               DType dtype, int64_t off);
 
 private:
     std::shared_ptr<Storage> storage_;

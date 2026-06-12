@@ -1,14 +1,23 @@
 #include "tensor_impl.h"
+#include "tensor_storage.h"
+#include <memory>
 
 
 TensorImpl::TensorImpl(std::shared_ptr<Storage> storage,
                const std::vector<int64_t>& shape,
                DType dtype)
-               : storage_(storage),
-                shape_(shape),
-                dtype_(dtype),                          
-                strides_(compute_strides(shape)),
-                offset_(0)
+               : TensorImpl(storage,shape,dtype,0)
+{};
+
+TensorImpl::TensorImpl(shared_ptr<Storage> storage, 
+            const vector<int64_t>& shape, 
+            DType dtype, 
+            int64_t off) :
+            storage_(storage),
+            shape_(shape),
+            dtype_(dtype),                          
+            strides_(compute_strides(shape)),
+            offset_(off)
 {};
 
 

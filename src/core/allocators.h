@@ -24,4 +24,19 @@ class CPUAllocator : public Allocator{
         return (Device::CPU);
     }
 };
+
+class CUDAAllocatorPlaceHolder : public Allocator{
+    //return a void pointer to any memory on cpu of size bytes
+    void* allocate(size_t bytes) override {
+        return (std::malloc(bytes));
+    }
+
+    void deallocate(void* ptr) override {
+        std::free(ptr);
+    }
+
+    Device device() const override {
+        return (Device::CPU);
+    }
+};
 #endif
