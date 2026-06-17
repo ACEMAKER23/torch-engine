@@ -24,6 +24,11 @@ public:
                const std::vector<int64_t>& shape,
                DType dtype, int64_t off);
 
+    TensorImpl(std::shared_ptr<Storage> storage,
+               const std::vector<int64_t>& shape,
+               const std::vector<int64_t>& strides,
+               DType dtype, int64_t off);
+
 private:
     std::shared_ptr<Storage> storage_;
 

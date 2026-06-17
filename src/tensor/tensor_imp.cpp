@@ -20,6 +20,18 @@ TensorImpl::TensorImpl(shared_ptr<Storage> storage,
             offset_(off)
 {};
 
+TensorImpl::TensorImpl(shared_ptr<Storage> storage,
+            const vector<int64_t>& shape,
+            const vector<int64_t>& strides,
+            DType dtype,
+            int64_t off) :
+            storage_(storage),
+            shape_(shape),
+            dtype_(dtype),
+            strides_(strides),
+            offset_(off)
+{};
+
 
 std::vector<int64_t> TensorImpl::compute_strides(
         const std::vector<int64_t>& shape){

@@ -15,6 +15,7 @@ set(TENSOR_SOURCES
     src/tensor/tensor.cpp
     src/tensor/tensor_imp.cpp
     src/tensor/tensor_storage.cpp
+    src/core/grad_fn.cpp
 )
 
 # Create Tensor library
@@ -22,9 +23,11 @@ add_library(tensor_lib STATIC ${TENSOR_SOURCES})
 
 # Test executable
 add_executable(tensor_test src/tests/tensor_test.cpp)
+add_executable(autograd_test src/tests/autograd_test.cpp)
 
 # Link libraries
 target_link_libraries(tensor_test tensor_lib GTest::GTest GTest::Main)
+target_link_libraries(autograd_test tensor_lib GTest::GTest GTest::Main)
 
 # Enable testing
 enable_testing()

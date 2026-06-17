@@ -1,9 +1,14 @@
 #include "tensor.h"
 #include "tensor_impl.h"
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <cstring>
 #include <stdexcept>
+#include <cmath>
+#include <optional>
+#include <stack>
+
 
 size_t Tensor::numel() const {return impl_->numel();}
 
@@ -20,18 +25,29 @@ Tensor::Tensor(std::vector<int64_t> shape, DType dtype, Device deviceT){
     auto storage = Storage::allocate(s * dtype_size(dtype), allocator);
     
     impl_=make_shared<TensorImpl>(storage, shape, dtype);
+    requiresGrad_=false;
+    grad_=nullptr;
+    gradFn_=nullptr;
+
 }
 
 Tensor::Tensor(shared_ptr<Storage> store, const std::vector<int64_t>& shape, DType dtype){
     impl_=make_shared<TensorImpl>(store,shape,dtype);
+    requiresGrad_=false;
+    grad_=nullptr;
+    gradFn_=nullptr;
 }
 
 Tensor::Tensor(shared_ptr<TensorImpl> tImple):
     impl_(tImple)
-{}
+{
+    requiresGrad_=false;
+    grad_=nullptr;
+    gradFn_=nullptr;
+}
 
 
-Tensor Tensor::clone(){
+Tensor Tensor::clone() const{
     size_t bt = impl_->storage()->bytes();
     Device devi = impl_->storage()->device();
     DType dty = impl_->dtype();
@@ -74,4 +90,414 @@ const std::vector<int64_t>& Tensor::shape() const{
 
 const std::vector<int64_t>& Tensor::strides() const{
     return (impl_->strides());
+}
+
+// PyTorch-style data access
+void* Tensor::data() {
+    return static_cast<void*>(
+        static_cast<char*>(impl_->storage()->data()) + 
+        impl_->offset() * dtype_size(impl_->dtype())
+    );
+}
+
+const void* Tensor::data() const {
+    return static_cast<const void*>(
+        static_cast<const char*>(impl_->storage()->data()) + 
+        impl_->offset() * dtype_size(impl_->dtype())
+    );
+}
+
+
+Tensor Tensor::operator*(const Tensor& other) const{
+    if (impl_->dtype() != other.impl_->dtype()) {
+        throw std::runtime_error("Dtypes must match for elementwise multiplication");
+    }
+    std::optional<Tensor> result;
+    switch (impl_->dtype()) {
+        case DType::Float32:
+            result = elementwise_operation<float>(*this, other, [](float a, float b) { return a * b; });
+            break;
+        case DType::Int32:
+            result = elementwise_operation<int32_t>(*this, other, [](int32_t a, int32_t b) { return a * b; });
+            break;
+        case DType::Int64:
+            result = elementwise_operation<int64_t>(*this, other, [](int64_t a, int64_t b) { return a * b; });
+            break;
+        default:
+            throw std::runtime_error("Unsupported dtype");
+    }
+    if (requiredGrad() || other.requiredGrad()){
+        auto fn = make_shared<MulBackward>();
+        fn->inputs = {const_cast<Tensor*>(this), const_cast<Tensor*>(&other)};
+        result->gradFn_ = fn;
+        result->requiresGrad_ = true;
+    }
+    return *result;
+}
+Tensor Tensor::operator+(const Tensor& other) const{
+    if (impl_->dtype() != other.impl_->dtype()) {
+        throw std::runtime_error("Dtypes must match for elementwise addition");
+    }
+    std::optional<Tensor> result;
+    switch (impl_->dtype()) {
+        case DType::Float32:
+            result = elementwise_operation<float>(*this, other, [](float a, float b) { return a + b; });
+            break;
+        case DType::Int32:
+            result = elementwise_operation<int32_t>(*this, other, [](int32_t a, int32_t b) { return a + b; });
+            break;
+        case DType::Int64:
+            result = elementwise_operation<int64_t>(*this, other, [](int64_t a, int64_t b) { return a + b; });
+            break;
+        default:
+            throw std::runtime_error("Unsupported dtype");
+    }
+    if (requiredGrad() || other.requiredGrad()){
+        auto fn = make_shared<AddBackward>();
+        fn->inputs = {const_cast<Tensor*>(this), const_cast<Tensor*>(&other)};
+        result->gradFn_ = fn;
+        result->requiresGrad_ = true;
+    }
+    return *result;
+}
+Tensor Tensor::operator-(const Tensor& other) const{
+    if (impl_->dtype() != other.impl_->dtype()) {
+        throw std::runtime_error("Dtypes must match for elementwise subtraction");
+    }
+    std::optional<Tensor> result;
+    switch (impl_->dtype()) {
+        case DType::Float32:
+            result = elementwise_operation<float>(*this, other, [](float a, float b) { return a - b; });
+            break;
+        case DType::Int32:
+            result = elementwise_operation<int32_t>(*this, other, [](int32_t a, int32_t b) { return a - b; });
+            break;
+        case DType::Int64:
+            result = elementwise_operation<int64_t>(*this, other, [](int64_t a, int64_t b) { return a - b; });
+            break;
+        default:
+            throw std::runtime_error("Unsupported dtype");
+    }
+    if (requiredGrad() || other.requiredGrad()){
+        auto fn = make_shared<SubBackward>();
+        fn->inputs = {const_cast<Tensor*>(this), const_cast<Tensor*>(&other)};
+        result->gradFn_ = fn;
+        result->requiresGrad_ = true;
+    }
+    return *result;
+}
+Tensor Tensor::operator/(const Tensor& other) const{
+    if (impl_->dtype() != other.impl_->dtype()) {
+        throw std::runtime_error("Dtypes must match for elementwise division");
+    }
+    std::optional<Tensor> result;
+    switch (impl_->dtype()) {
+        case DType::Float32:
+            result = elementwise_operation<float>(*this, other, [](float a, float b) { return a / b; });
+            break;
+        case DType::Int32:
+            result = elementwise_operation<int32_t>(*this, other, [](int32_t a, int32_t b) { return a / b; });
+            break;
+        case DType::Int64:
+            result = elementwise_operation<int64_t>(*this, other, [](int64_t a, int64_t b) { return a / b; });
+            break;
+        default:
+            throw std::runtime_error("Unsupported dtype");
+    }
+    if (requiredGrad() || other.requiredGrad()){
+        auto fn = make_shared<DivBackward>();
+        fn->inputs = {const_cast<Tensor*>(this), const_cast<Tensor*>(&other)};
+        result->gradFn_ = fn;
+        result->requiresGrad_ = true;
+    }
+    return *result;
+}
+
+Tensor Tensor::operator-() const {
+    Tensor result = clone();
+    switch (impl_->dtype()) {
+        case DType::Float32:
+            for (size_t i = 0; i < result.numel(); ++i) {
+                result.at<float>(i) = -result.at<float>(i);
+            }
+            break;
+        case DType::Int32:
+            for (size_t i = 0; i < result.numel(); ++i) {
+                result.at<int32_t>(i) = -result.at<int32_t>(i);
+            }
+            break;
+        case DType::Int64:
+            for (size_t i = 0; i < result.numel(); ++i) {
+                result.at<int64_t>(i) = -result.at<int64_t>(i);
+            }
+            break;
+        default:
+            throw std::runtime_error("Unsupported dtype");
+    }
+    return result;
+}
+
+
+void Tensor::transpose() {
+    size_t dimension = shape().size();
+    if (dimension != 2) {
+        throw runtime_error("transpose() without args only works for 2D tensors");
+    }
+    transpose(0, 1);
+}
+
+void Tensor::transpose(size_t d1, size_t d2) {
+    size_t dimension = shape().size();
+    if (d1 >= dimension || d2 >= dimension || d1 == d2) {
+        throw runtime_error("Invalid transpose dimensions");
+    }
+    
+    // Swap shape dimensions
+    std::vector<int64_t> newShape = shape();
+    std::swap(newShape[d1], newShape[d2]);
+    
+    // Swap stride dimensions  
+    std::vector<int64_t> newStrides = strides();
+    std::swap(newStrides[d1], newStrides[d2]);
+    
+    // Zero-copy transpose using custom strides
+    impl_ = make_shared<TensorImpl>(impl_->storage(), newShape, newStrides, impl_->dtype(), impl_->offset());
+}
+
+Tensor Tensor::transpose_view(size_t d1, size_t d2) const {
+    size_t dimension = shape().size();
+    if (d1 >= dimension || d2 >= dimension || d1 == d2) {
+        throw runtime_error("Invalid transpose dimensions");
+    }
+    
+    // Swap shape dimensions
+    std::vector<int64_t> newShape = shape();
+    std::swap(newShape[d1], newShape[d2]);
+    
+    // Swap stride dimensions  
+    std::vector<int64_t> newStrides = strides();
+    std::swap(newStrides[d1], newStrides[d2]);
+    
+    // Zero-copy transpose using custom strides
+    auto newImpl = make_shared<TensorImpl>(impl_->storage(), newShape, newStrides, impl_->dtype(), impl_->offset());
+    return Tensor(newImpl);
+}
+
+// Non-inplace versions (create new tensors and return them)
+Tensor Tensor::relu() {
+    Tensor result = clone();
+    switch (impl_->dtype()) {
+        case DType::Float32:
+            result.relu_<float>();
+            break;
+        case DType::Int32:
+            result.relu_<int32_t>();
+            break;
+        case DType::Int64:
+            result.relu_<int64_t>();
+            break;
+        default:
+            throw std::runtime_error("Unsupported dtype");
+    }
+    return result;
+}
+
+Tensor Tensor::gelu() {
+    Tensor result = clone();
+    switch (impl_->dtype()) {
+        case DType::Float32:
+            result.gelu_<float>();
+            break;
+        case DType::Int32:
+            result.gelu_<int32_t>();
+            break;
+        case DType::Int64:
+            result.gelu_<int64_t>();
+            break;
+        default:
+            throw std::runtime_error("Unsupported dtype");
+    }
+    return result;
+}
+
+// Stub implementations for remaining activations
+
+Tensor Tensor::sigmoid() {
+    Tensor result = clone();
+    switch (impl_->dtype()) {
+        case DType::Float32:
+            result.sigmoid_<float>();
+            break;
+        case DType::Int32:
+            result.sigmoid_<int32_t>();
+            break;
+        case DType::Int64:
+            result.sigmoid_<int64_t>();
+            break;
+        default:
+            throw std::runtime_error("Unsupported dtype");
+    }
+    return result;
+}
+
+Tensor Tensor::sqrt() {
+    Tensor result = clone();
+    switch (impl_->dtype()) {
+        case DType::Float32:
+            result.sqrt_<float>();
+            break;
+        case DType::Int32:
+            result.sqrt_<int32_t>();
+            break;
+        case DType::Int64:
+            result.sqrt_<int64_t>();
+            break;
+        default:
+            throw std::runtime_error("Unsupported dtype");
+    }
+    return result;
+}
+
+Tensor Tensor::exp() {
+    Tensor result = clone();
+    switch (impl_->dtype()) {
+        case DType::Float32:
+            result.exp_<float>();
+            break;
+        case DType::Int32:
+            result.exp_<int32_t>();
+            break;
+        case DType::Int64:
+            result.exp_<int64_t>();
+            break;
+        default:
+            throw std::runtime_error("Unsupported dtype");
+    }
+    return result;
+}
+
+Tensor Tensor::log() {
+    Tensor result = clone();
+    switch (impl_->dtype()) {
+        case DType::Float32:
+            result.log_<float>();
+            break;
+        case DType::Int32:
+            result.log_<int32_t>();
+            break;
+        case DType::Int64:
+            result.log_<int64_t>();
+            break;
+        default:
+            throw std::runtime_error("Unsupported dtype");
+    }
+    return result;
+}
+
+Tensor Tensor::matmul(const Tensor& other) const {
+    std::optional<Tensor> result;
+    switch (impl_->dtype()) {
+        case DType::Float32:
+            result = matmul_impl<float>(*this, other);
+            break;
+        case DType::Int32:
+            result = matmul_impl<int32_t>(*this, other);
+            break;
+        case DType::Int64:
+            result = matmul_impl<int64_t>(*this, other);
+            break;
+        default:
+            throw runtime_error("Unsupported dtype");
+    }
+    if (requiredGrad() || other.requiredGrad()){
+        auto fn = make_shared<MatMulBackward>();
+        fn->inputs = {const_cast<Tensor*>(this), const_cast<Tensor*>(&other)};
+        result->gradFn_ = fn;
+        result->requiresGrad_ = true;
+    }
+    return *result;
+}
+
+Tensor Tensor::broadcast(const std::vector<int64_t>& target_shape) const {
+    // Compute broadcasted shape and verify compatibility
+    std::vector<int64_t> current_shape = impl_->shape();
+    size_t ndim = current_shape.size();
+    size_t target_ndim = target_shape.size();
+    
+    // Verify compatibility (right-aligned comparison)
+    for (size_t i = 0; i < target_ndim; ++i) {
+        int64_t dim = (i < ndim) ? current_shape[ndim - 1 - i] : 1;
+        int64_t target_dim = target_shape[target_ndim - 1 - i];
+        
+        if (dim != target_dim && dim != 1 && target_dim != 1) {
+            throw runtime_error("Shapes are not broadcastable");
+        }
+    }
+    
+    // Compute broadcasted strides (right-aligned)
+    std::vector<int64_t> new_strides(target_ndim);
+    
+    for (size_t i = 0; i < target_ndim; ++i) {
+        // Right-align: compare from the right
+        int64_t target_idx = target_ndim - 1 - i;
+        int64_t current_idx = ndim - 1 - i;
+        
+        if (current_idx < 0 || current_shape[current_idx] == 1) {
+            // Dimension is missing or size 1 - set stride to 0 (broadcasting)
+            new_strides[target_idx] = 0;
+        } else {
+            // Keep original stride
+            new_strides[target_idx] = impl_->strides()[current_idx];
+        }
+    }
+    
+    // Create a view with new shape and strides (zero-copy)
+    auto new_impl = std::make_shared<TensorImpl>(
+        impl_->storage(),
+        target_shape,
+        new_strides,
+        impl_->dtype(),
+        impl_->offset()
+    );
+    
+    return Tensor(new_impl);
+}
+
+void Tensor::backward() {
+    // Initialize gradient to 1.0 (scalar loss)
+    Tensor grad_output({1}, impl_->dtype(), impl_->storage()->device());
+    grad_output.at<float>(0) = 1.0f;
+    
+    // Call private implementation
+    backward_impl(grad_output);
+}
+
+void Tensor::backward_impl(const Tensor& passedDownGrad){
+    stack<pair<Tensor,Tensor>> currentPre;
+    currentPre.push({*this,passedDownGrad});
+
+    while (!currentPre.empty()){
+        auto current = currentPre.top();
+        //gradient of all the input to the current tensor
+        currentPre.pop();
+
+        if (!current.first.gradFn()) continue;
+        auto inputGradent=current.first.gradFn()->backward(current.second);
+        
+        for(size_t i=0; i<inputGradent.size(); ++i){
+            auto& input = current.first.gradFn()->inputs[i];
+            
+            if (input->requiredGrad() && !input->gradFn()){  // Leaf node requiring grad
+                if (!input->grad_) {
+                        input->grad_ = make_shared<Tensor>(inputGradent[i]);
+                    } else {
+                        // Accumulate if gradient already exists
+                        *input->grad_ = *input->grad_ + inputGradent[i];
+                    }
+            }
+            else if (input->requiredGrad()){  // Non-leaf, continue traversal
+                currentPre.push({*input,inputGradent[i]});
+            }
+        }
+    }
 }

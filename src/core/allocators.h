@@ -1,6 +1,7 @@
 #ifndef ALLOCATOR
 #define ALLOCATOR
 
+#include <cstdlib>
 #include "dtype.h"
 class Allocator{
 public:
