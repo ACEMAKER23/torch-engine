@@ -7,6 +7,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Find GoogleTest
 find_package(GTest REQUIRED)
 
+# Find CUDA
+find_package(CUDA REQUIRED)
+include_directories(${CUDA_INCLUDE_DIRS})
+
 # Include directories
 include_directories(${CMAKE_SOURCE_DIR}/src)
 
@@ -16,6 +20,7 @@ set(TENSOR_SOURCES
     src/tensor/tensor_imp.cpp
     src/tensor/tensor_storage.cpp
     src/core/grad_fn.cpp
+    src/core/cuda_utils.cpp
 )
 
 # Create Tensor library
@@ -26,8 +31,8 @@ add_executable(tensor_test src/tests/tensor_test.cpp)
 add_executable(autograd_test src/tests/autograd_test.cpp)
 
 # Link libraries
-target_link_libraries(tensor_test tensor_lib GTest::GTest GTest::Main)
-target_link_libraries(autograd_test tensor_lib GTest::GTest GTest::Main)
+target_link_libraries(tensor_test tensor_lib GTest::GTest GTest::Main ${CUDA_LIBRARIES})
+target_link_libraries(autograd_test tensor_lib GTest::GTest GTest::Main ${CUDA_LIBRARIES})
 
 # Enable testing
 enable_testing()

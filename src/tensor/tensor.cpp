@@ -12,6 +12,10 @@
 
 size_t Tensor::numel() const {return impl_->numel();}
 
+Device Tensor::device() const {
+    return impl_->storage()->device();
+}
+
 Tensor::Tensor(std::vector<int64_t> shape, DType dtype, Device deviceT){
     size_t s = 1;
     for(int64_t sh : shape) s*=sh;
@@ -25,25 +29,15 @@ Tensor::Tensor(std::vector<int64_t> shape, DType dtype, Device deviceT){
     auto storage = Storage::allocate(s * dtype_size(dtype), allocator);
     
     impl_=make_shared<TensorImpl>(storage, shape, dtype);
-    requiresGrad_=false;
-    grad_=nullptr;
-    gradFn_=nullptr;
-
 }
 
 Tensor::Tensor(shared_ptr<Storage> store, const std::vector<int64_t>& shape, DType dtype){
     impl_=make_shared<TensorImpl>(store,shape,dtype);
-    requiresGrad_=false;
-    grad_=nullptr;
-    gradFn_=nullptr;
 }
 
 Tensor::Tensor(shared_ptr<TensorImpl> tImple):
     impl_(tImple)
 {
-    requiresGrad_=false;
-    grad_=nullptr;
-    gradFn_=nullptr;
 }
 
 
@@ -128,9 +122,9 @@ Tensor Tensor::operator*(const Tensor& other) const{
     }
     if (requiredGrad() || other.requiredGrad()){
         auto fn = make_shared<MulBackward>();
-        fn->inputs = {const_cast<Tensor*>(this), const_cast<Tensor*>(&other)};
-        result->gradFn_ = fn;
-        result->requiresGrad_ = true;
+        fn->inputs = {*this, other};
+        result->impl_->set_grad_fn(fn);
+        result->impl_->set_requires_grad(true);
     }
     return *result;
 }
@@ -154,9 +148,9 @@ Tensor Tensor::operator+(const Tensor& other) const{
     }
     if (requiredGrad() || other.requiredGrad()){
         auto fn = make_shared<AddBackward>();
-        fn->inputs = {const_cast<Tensor*>(this), const_cast<Tensor*>(&other)};
-        result->gradFn_ = fn;
-        result->requiresGrad_ = true;
+        fn->inputs = {*this, other};
+        result->impl_->set_grad_fn(fn);
+        result->impl_->set_requires_grad(true);
     }
     return *result;
 }
@@ -180,9 +174,9 @@ Tensor Tensor::operator-(const Tensor& other) const{
     }
     if (requiredGrad() || other.requiredGrad()){
         auto fn = make_shared<SubBackward>();
-        fn->inputs = {const_cast<Tensor*>(this), const_cast<Tensor*>(&other)};
-        result->gradFn_ = fn;
-        result->requiresGrad_ = true;
+        fn->inputs = {*this, other};
+        result->impl_->set_grad_fn(fn);
+        result->impl_->set_requires_grad(true);
     }
     return *result;
 }
@@ -206,9 +200,9 @@ Tensor Tensor::operator/(const Tensor& other) const{
     }
     if (requiredGrad() || other.requiredGrad()){
         auto fn = make_shared<DivBackward>();
-        fn->inputs = {const_cast<Tensor*>(this), const_cast<Tensor*>(&other)};
-        result->gradFn_ = fn;
-        result->requiresGrad_ = true;
+        fn->inputs = {*this, other};
+        result->impl_->set_grad_fn(fn);
+        result->impl_->set_requires_grad(true);
     }
     return *result;
 }
@@ -299,6 +293,12 @@ Tensor Tensor::relu() {
         default:
             throw std::runtime_error("Unsupported dtype");
     }
+    if (requiredGrad()) {
+        auto fn = make_shared<ReluBackward>();
+        fn->inputs = {*this};
+        result.impl_->set_grad_fn(fn);
+        result.impl_->set_requires_grad(true);
+    }
     return result;
 }
 
@@ -316,6 +316,12 @@ Tensor Tensor::gelu() {
             break;
         default:
             throw std::runtime_error("Unsupported dtype");
+    }
+    if (requiredGrad()) {
+        auto fn = make_shared<GeluBackward>();
+        fn->inputs = {*this};
+        result.impl_->set_grad_fn(fn);
+        result.impl_->set_requires_grad(true);
     }
     return result;
 }
@@ -336,6 +342,12 @@ Tensor Tensor::sigmoid() {
             break;
         default:
             throw std::runtime_error("Unsupported dtype");
+    }
+    if (requiredGrad()) {
+        auto fn = make_shared<SigmoidBackward>();
+        fn->inputs = {*this};
+        result.impl_->set_grad_fn(fn);
+        result.impl_->set_requires_grad(true);
     }
     return result;
 }
@@ -411,11 +423,66 @@ Tensor Tensor::matmul(const Tensor& other) const {
     }
     if (requiredGrad() || other.requiredGrad()){
         auto fn = make_shared<MatMulBackward>();
-        fn->inputs = {const_cast<Tensor*>(this), const_cast<Tensor*>(&other)};
-        result->gradFn_ = fn;
-        result->requiresGrad_ = true;
+        fn->inputs = {*this, other};
+        result->impl_->set_grad_fn(fn);
+        result->impl_->set_requires_grad(true);
     }
     return *result;
+}
+
+Tensor Tensor::sum(int64_t dim) const {
+    if (dim < 0 || dim >= static_cast<int64_t>(shape().size())) {
+        throw std::runtime_error("Dimension out of range for sum");
+    }
+
+    // Calculate output shape (remove the summed dimension)
+    std::vector<int64_t> output_shape = shape();
+    output_shape.erase(output_shape.begin() + dim);
+
+    // Create result tensor
+    Tensor result(output_shape, impl_->dtype(), impl_->storage()->device());
+
+    // Sum over the specified dimension
+    switch (impl_->dtype()) {
+        case DType::Float32:
+            sum_impl<float>(result, dim);
+            break;
+        default:
+            throw std::runtime_error("Unsupported dtype for sum over dimension");
+    }
+
+    return result;
+}
+
+template<typename T>
+void Tensor::sum_impl(Tensor& result, int64_t dim) const {
+    const std::vector<int64_t>& in_shape = shape();
+    const std::vector<int64_t>& out_shape = result.shape();
+
+    // Iterate through output indices and sum over the specified dimension
+    std::vector<int64_t> out_indices(out_shape.size(), 0);
+
+    for (size_t out_flat = 0; out_flat < result.numel(); ++out_flat) {
+        // Convert flat output index to multi-dimensional indices
+        size_t temp = out_flat;
+        for (int64_t i = out_shape.size() - 1; i >= 0; --i) {
+            out_indices[i] = temp % out_shape[i];
+            temp /= out_shape[i];
+        }
+
+        // Reconstruct input indices by inserting the summed dimension
+        std::vector<int64_t> in_indices = out_indices;
+        in_indices.insert(in_indices.begin() + dim, 0);
+
+        // Sum over the specified dimension
+        T sum_val = 0;
+        for (int64_t i = 0; i < in_shape[dim]; ++i) {
+            in_indices[dim] = i;
+            sum_val += at<T>(in_indices);
+        }
+
+        result.at<T>(out_indices) = sum_val;
+    }
 }
 
 Tensor Tensor::broadcast(const std::vector<int64_t>& target_shape) const {
@@ -464,10 +531,12 @@ Tensor Tensor::broadcast(const std::vector<int64_t>& target_shape) const {
 }
 
 void Tensor::backward() {
-    // Initialize gradient to 1.0 (scalar loss)
-    Tensor grad_output({1}, impl_->dtype(), impl_->storage()->device());
-    grad_output.at<float>(0) = 1.0f;
-    
+    // Seed gradient is ones with the same shape as this tensor (d(loss)/d(loss) = 1).
+    Tensor grad_output(impl_->shape(), impl_->dtype(), impl_->storage()->device());
+    for (size_t i = 0; i < grad_output.numel(); ++i) {
+        grad_output.at<float>(i) = 1.0f;
+    }
+
     // Call private implementation
     backward_impl(grad_output);
 }
@@ -483,20 +552,23 @@ void Tensor::backward_impl(const Tensor& passedDownGrad){
 
         if (!current.first.gradFn()) continue;
         auto inputGradent=current.first.gradFn()->backward(current.second);
-        
+
         for(size_t i=0; i<inputGradent.size(); ++i){
-            auto& input = current.first.gradFn()->inputs[i];
-            
-            if (input->requiredGrad() && !input->gradFn()){  // Leaf node requiring grad
-                if (!input->grad_) {
-                        input->grad_ = make_shared<Tensor>(inputGradent[i]);
-                    } else {
-                        // Accumulate if gradient already exists
-                        *input->grad_ = *input->grad_ + inputGradent[i];
-                    }
+            // input shares its TensorImpl (data + autograd state) with the
+            // original tensor, so writing the gradient here propagates back to
+            // the leaf the user holds.
+            Tensor& input = current.first.gradFn()->inputs[i];
+
+            if (input.requiredGrad() && !input.gradFn()){  // Leaf node requiring grad
+                if (!input.impl_->grad()) {
+                    input.impl_->set_grad(make_shared<Tensor>(inputGradent[i]));
+                } else {
+                    // Accumulate if gradient already exists
+                    *input.impl_->grad() = *input.impl_->grad() + inputGradent[i];
+                }
             }
-            else if (input->requiredGrad()){  // Non-leaf, continue traversal
-                currentPre.push({*input,inputGradent[i]});
+            else if (input.requiredGrad()){  // Non-leaf, continue traversal
+                currentPre.push({input,inputGradent[i]});
             }
         }
     }

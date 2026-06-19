@@ -61,7 +61,7 @@ TEST_F(AutogradTest, AddBackwardBasic) {
     Tensor c = a + b;
     auto fn = std::dynamic_pointer_cast<AddBackward>(c.gradFn());
     ASSERT_NE(fn, nullptr);
-    fn->inputs = {&a, &b};
+    fn->inputs = {a, b};
     
     // Create gradient output (all ones)
     Tensor grad_output({2, 2}, DType::Float32, Device::CPU);
@@ -94,7 +94,7 @@ TEST_F(AutogradTest, SubBackwardBasic) {
     Tensor c = a - b;
     auto fn = std::dynamic_pointer_cast<SubBackward>(c.gradFn());
     ASSERT_NE(fn, nullptr);
-    fn->inputs = {&a, &b};
+    fn->inputs = {a, b};
     
     Tensor grad_output({2, 2}, DType::Float32, Device::CPU);
     for (size_t i = 0; i < grad_output.numel(); ++i) {
@@ -126,7 +126,7 @@ TEST_F(AutogradTest, MulBackwardBasic) {
     Tensor c = a * b;
     auto fn = std::dynamic_pointer_cast<MulBackward>(c.gradFn());
     ASSERT_NE(fn, nullptr);
-    fn->inputs = {&a, &b};
+    fn->inputs = {a, b};
     
     Tensor grad_output({2, 2}, DType::Float32, Device::CPU);
     for (size_t i = 0; i < grad_output.numel(); ++i) {
@@ -158,7 +158,7 @@ TEST_F(AutogradTest, DivBackwardBasic) {
     Tensor c = a / b;
     auto fn = std::dynamic_pointer_cast<DivBackward>(c.gradFn());
     ASSERT_NE(fn, nullptr);
-    fn->inputs = {&a, &b};
+    fn->inputs = {a, b};
     
     Tensor grad_output({2, 2}, DType::Float32, Device::CPU);
     for (size_t i = 0; i < grad_output.numel(); ++i) {
@@ -193,7 +193,7 @@ TEST_F(AutogradTest, MatMulBackwardBasic) {
     Tensor c = a.matmul(b);
     auto fn = std::dynamic_pointer_cast<MatMulBackward>(c.gradFn());
     ASSERT_NE(fn, nullptr);
-    fn->inputs = {&a, &b};
+    fn->inputs = {a, b};
     
     Tensor grad_output({2, 2}, DType::Float32, Device::CPU);
     for (size_t i = 0; i < grad_output.numel(); ++i) {
@@ -284,7 +284,7 @@ TEST_F(AutogradTest, GradientsNoGraph) {
     
     Tensor c = a * b;
     auto fn = std::dynamic_pointer_cast<MulBackward>(c.gradFn());
-    fn->inputs = {&a, &b};
+    fn->inputs = {a, b};
     
     Tensor grad_output({2, 2}, DType::Float32, Device::CPU);
     for (size_t i = 0; i < grad_output.numel(); ++i) {
@@ -329,7 +329,7 @@ TEST_F(AutogradTest, ScalarTensor) {
     
     Tensor c = a * b;
     auto fn = std::dynamic_pointer_cast<MulBackward>(c.gradFn());
-    fn->inputs = {&a, &b};
+    fn->inputs = {a, b};
     
     Tensor grad_output({1}, DType::Float32, Device::CPU);
     grad_output.at<float>(0) = 1.0f;
@@ -354,7 +354,7 @@ TEST_F(AutogradTest, ZeroGradients) {
     
     Tensor c = a + b;
     auto fn = std::dynamic_pointer_cast<AddBackward>(c.gradFn());
-    fn->inputs = {&a, &b};
+    fn->inputs = {a, b};
     
     Tensor grad_output({2, 2}, DType::Float32, Device::CPU);
     for (size_t i = 0; i < grad_output.numel(); ++i) {
@@ -423,9 +423,7 @@ TEST_F(AutogradTest, BackwardMethodMultiplication) {
 }
 
 // Test backward() method with chained operations
-// DISABLED: Chained operations have dangling pointer issue with current design
-// TODO: Fix by implementing proper tensor lifetime management (requires major refactor)
-TEST_F(AutogradTest, DISABLED_BackwardMethodChained) {
+TEST_F(AutogradTest, BackwardMethodChained) {
     Tensor a({2, 2}, DType::Float32, Device::CPU);
     a.setRequiresGrad(true);
     Tensor b({2, 2}, DType::Float32, Device::CPU);
@@ -529,5 +527,622 @@ TEST_F(AutogradTest, BackwardMethodDivision) {
     for (size_t i = 0; i < a.grad()->numel(); ++i) {
         EXPECT_FLOAT_EQ(a.grad()->at<float>(i), 0.5f);
         EXPECT_FLOAT_EQ(b.grad()->at<float>(i), -1.5f);
+    }
+}
+
+// Test deeply nested chained operations
+TEST_F(AutogradTest, BackwardMethodDeepNesting) {
+    Tensor a({2, 2}, DType::Float32, Device::CPU);
+    a.setRequiresGrad(true);
+    Tensor b({2, 2}, DType::Float32, Device::CPU);
+    b.setRequiresGrad(true);
+    Tensor c({2, 2}, DType::Float32, Device::CPU);
+    c.setRequiresGrad(true);
+    Tensor d({2, 2}, DType::Float32, Device::CPU);
+    d.setRequiresGrad(true);
+
+    for (size_t i = 0; i < a.numel(); ++i) {
+        a.at<float>(i) = 1.0f;
+        b.at<float>(i) = 2.0f;
+        c.at<float>(i) = 3.0f;
+        d.at<float>(i) = 4.0f;
+    }
+
+    // loss = ((a * b) + c) - d
+    Tensor loss = ((a * b) + c) - d;
+    loss.backward();
+
+    ASSERT_NE(a.grad(), nullptr);
+    ASSERT_NE(b.grad(), nullptr);
+    ASSERT_NE(c.grad(), nullptr);
+    ASSERT_NE(d.grad(), nullptr);
+
+    // dL/da = 1 * b = 2
+    // dL/db = 1 * a = 1
+    // dL/dc = 1
+    // dL/dd = -1
+    for (size_t i = 0; i < a.numel(); ++i) {
+        EXPECT_FLOAT_EQ(a.grad()->at<float>(i), 2.0f);
+        EXPECT_FLOAT_EQ(b.grad()->at<float>(i), 1.0f);
+        EXPECT_FLOAT_EQ(c.grad()->at<float>(i), 1.0f);
+        EXPECT_FLOAT_EQ(d.grad()->at<float>(i), -1.0f);
+    }
+}
+
+// Test fan-out: one tensor used multiple times (gradient accumulation)
+TEST_F(AutogradTest, BackwardMethodFanOut) {
+    Tensor a({2, 2}, DType::Float32, Device::CPU);
+    a.setRequiresGrad(true);
+    Tensor b({2, 2}, DType::Float32, Device::CPU);
+    b.setRequiresGrad(true);
+    Tensor c({2, 2}, DType::Float32, Device::CPU);
+    c.setRequiresGrad(true);
+
+    for (size_t i = 0; i < a.numel(); ++i) {
+        a.at<float>(i) = 2.0f;
+        b.at<float>(i) = 3.0f;
+        c.at<float>(i) = 4.0f;
+    }
+
+    // loss = (a * b) + (a * c)
+    // dL/da = b + c = 3 + 4 = 7
+    // dL/db = a = 2
+    // dL/dc = a = 2
+    Tensor loss = (a * b) + (a * c);
+    loss.backward();
+
+    ASSERT_NE(a.grad(), nullptr);
+    ASSERT_NE(b.grad(), nullptr);
+    ASSERT_NE(c.grad(), nullptr);
+
+    for (size_t i = 0; i < a.numel(); ++i) {
+        EXPECT_FLOAT_EQ(a.grad()->at<float>(i), 7.0f);
+        EXPECT_FLOAT_EQ(b.grad()->at<float>(i), 2.0f);
+        EXPECT_FLOAT_EQ(c.grad()->at<float>(i), 2.0f);
+    }
+}
+
+// Test chained operations with broadcasting
+TEST_F(AutogradTest, BackwardMethodChainedBroadcasting) {
+    Tensor a({1, 2}, DType::Float32, Device::CPU);
+    a.setRequiresGrad(true);
+    Tensor b({2, 2}, DType::Float32, Device::CPU);
+    b.setRequiresGrad(true);
+
+    for (size_t i = 0; i < a.numel(); ++i) {
+        a.at<float>(i) = 2.0f;
+    }
+    for (size_t i = 0; i < b.numel(); ++i) {
+        b.at<float>(i) = 3.0f;
+    }
+
+    // Broadcasting: a (1x2) + b (2x2) -> (2x2)
+    Tensor c = a + b;
+    c.backward();
+
+    ASSERT_NE(a.grad(), nullptr);
+    ASSERT_NE(b.grad(), nullptr);
+
+    // For broadcasting addition: grad_a is summed over broadcast dimensions
+    // a (1,2) is broadcast to (2,2), so each element of a contributes to 2 positions
+    // grad_a should be [2, 2] (sum over dimension 0)
+    // grad_b is just 1 (no broadcasting)
+    for (size_t i = 0; i < a.grad()->numel(); ++i) {
+        EXPECT_FLOAT_EQ(a.grad()->at<float>(i), 2.0f);  // sum over broadcast dim
+    }
+    for (size_t i = 0; i < b.grad()->numel(); ++i) {
+        EXPECT_FLOAT_EQ(b.grad()->at<float>(i), 1.0f);
+    }
+}
+
+// Test chained operations with matmul
+TEST_F(AutogradTest, BackwardMethodChainedMatmul) {
+    Tensor a({2, 3}, DType::Float32, Device::CPU);
+    a.setRequiresGrad(true);
+    Tensor b({3, 2}, DType::Float32, Device::CPU);
+    b.setRequiresGrad(true);
+    Tensor c({2, 2}, DType::Float32, Device::CPU);
+    c.setRequiresGrad(true);
+
+    for (size_t i = 0; i < a.numel(); ++i) {
+        a.at<float>(i) = 1.0f;
+    }
+    for (size_t i = 0; i < b.numel(); ++i) {
+        b.at<float>(i) = 1.0f;
+    }
+    for (size_t i = 0; i < c.numel(); ++i) {
+        c.at<float>(i) = 1.0f;
+    }
+
+    // loss = (a @ b) + c
+    Tensor loss = a.matmul(b) + c;
+    loss.backward();
+
+    ASSERT_NE(a.grad(), nullptr);
+    ASSERT_NE(b.grad(), nullptr);
+    ASSERT_NE(c.grad(), nullptr);
+
+    // dL/dc = 1
+    // dL/d(ab) = 1
+    // dL/da = 1 @ b^T
+    // dL/db = a^T @ 1
+    // With all ones, grad_a should have shape (2,3), grad_b shape (3,2)
+    EXPECT_EQ(a.grad()->shape(), std::vector<int64_t>({2, 3}));
+    EXPECT_EQ(b.grad()->shape(), std::vector<int64_t>({3, 2}));
+    EXPECT_EQ(c.grad()->shape(), std::vector<int64_t>({2, 2}));
+
+    for (size_t i = 0; i < c.grad()->numel(); ++i) {
+        EXPECT_FLOAT_EQ(c.grad()->at<float>(i), 1.0f);
+    }
+}
+
+// Test multiple backward calls (gradient accumulation)
+TEST_F(AutogradTest, BackwardMethodMultipleCalls) {
+    Tensor a({2, 2}, DType::Float32, Device::CPU);
+    a.setRequiresGrad(true);
+    Tensor b({2, 2}, DType::Float32, Device::CPU);
+    b.setRequiresGrad(true);
+
+    for (size_t i = 0; i < a.numel(); ++i) {
+        a.at<float>(i) = 2.0f;
+        b.at<float>(i) = 3.0f;
+    }
+
+    // First backward
+    Tensor loss1 = a * b;
+    loss1.backward();
+
+    // Second backward (should accumulate)
+    Tensor loss2 = a + b;
+    loss2.backward();
+
+    ASSERT_NE(a.grad(), nullptr);
+    ASSERT_NE(b.grad(), nullptr);
+
+    // dL1/da = b = 3, dL2/da = 1 -> total = 4
+    // dL1/db = a = 2, dL2/db = 1 -> total = 3
+    for (size_t i = 0; i < a.numel(); ++i) {
+        EXPECT_FLOAT_EQ(a.grad()->at<float>(i), 4.0f);
+        EXPECT_FLOAT_EQ(b.grad()->at<float>(i), 3.0f);
+    }
+}
+
+// Test zero gradients with complex chains
+TEST_F(AutogradTest, BackwardMethodZeroGradientChain) {
+    Tensor a({2, 2}, DType::Float32, Device::CPU);
+    a.setRequiresGrad(true);
+    Tensor b({2, 2}, DType::Float32, Device::CPU);
+    b.setRequiresGrad(true);
+
+    for (size_t i = 0; i < a.numel(); ++i) {
+        a.at<float>(i) = 1.0f;
+        b.at<float>(i) = 2.0f;
+    }
+
+    // loss = (a * b) + (a * b) = 2 * a * b
+    Tensor loss = (a * b) + (a * b);
+    loss.backward();
+
+    ASSERT_NE(a.grad(), nullptr);
+    ASSERT_NE(b.grad(), nullptr);
+
+    // dL/da = 2 * b = 4
+    // dL/db = 2 * a = 2
+    for (size_t i = 0; i < a.numel(); ++i) {
+        EXPECT_FLOAT_EQ(a.grad()->at<float>(i), 4.0f);
+        EXPECT_FLOAT_EQ(b.grad()->at<float>(i), 2.0f);
+    }
+}
+
+// Test partial gradients in complex chain
+TEST_F(AutogradTest, BackwardMethodPartialGradientChain) {
+    Tensor a({2, 2}, DType::Float32, Device::CPU);
+    a.setRequiresGrad(true);
+    Tensor b({2, 2}, DType::Float32, Device::CPU);
+    b.setRequiresGrad(false);  // b doesn't require grad
+    Tensor c({2, 2}, DType::Float32, Device::CPU);
+    c.setRequiresGrad(true);
+
+    for (size_t i = 0; i < a.numel(); ++i) {
+        a.at<float>(i) = 1.0f;
+        b.at<float>(i) = 2.0f;
+        c.at<float>(i) = 3.0f;
+    }
+
+    // loss = (a * b) + c
+    Tensor loss = (a * b) + c;
+    loss.backward();
+
+    ASSERT_NE(a.grad(), nullptr);
+    EXPECT_EQ(b.grad(), nullptr);  // b doesn't require grad
+    ASSERT_NE(c.grad(), nullptr);
+
+    // dL/da = b = 2
+    // dL/dc = 1
+    for (size_t i = 0; i < a.numel(); ++i) {
+        EXPECT_FLOAT_EQ(a.grad()->at<float>(i), 2.0f);
+    }
+    for (size_t i = 0; i < c.numel(); ++i) {
+        EXPECT_FLOAT_EQ(c.grad()->at<float>(i), 1.0f);
+    }
+}
+
+// Test division in complex chain
+TEST_F(AutogradTest, BackwardMethodDivisionChain) {
+    Tensor a({2, 2}, DType::Float32, Device::CPU);
+    a.setRequiresGrad(true);
+    Tensor b({2, 2}, DType::Float32, Device::CPU);
+    b.setRequiresGrad(true);
+    Tensor c({2, 2}, DType::Float32, Device::CPU);
+    c.setRequiresGrad(true);
+
+    for (size_t i = 0; i < a.numel(); ++i) {
+        a.at<float>(i) = 8.0f;
+        b.at<float>(i) = 2.0f;
+        c.at<float>(i) = 1.0f;
+    }
+
+    // loss = (a / b) + c
+    Tensor loss = (a / b) + c;
+    loss.backward();
+
+    ASSERT_NE(a.grad(), nullptr);
+    ASSERT_NE(b.grad(), nullptr);
+    ASSERT_NE(c.grad(), nullptr);
+
+    // dL/da = 1/b = 0.5
+    // dL/db = -a/b^2 = -8/4 = -2
+    // dL/dc = 1
+    for (size_t i = 0; i < a.grad()->numel(); ++i) {
+        EXPECT_FLOAT_EQ(a.grad()->at<float>(i), 0.5f);
+        EXPECT_FLOAT_EQ(b.grad()->at<float>(i), -2.0f);
+        EXPECT_FLOAT_EQ(c.grad()->at<float>(i), 1.0f);
+    }
+}
+
+// Test broadcasting with subtraction
+TEST_F(AutogradTest, BackwardMethodSubtractionBroadcasting) {
+    Tensor a({1, 2}, DType::Float32, Device::CPU);
+    a.setRequiresGrad(true);
+    Tensor b({2, 2}, DType::Float32, Device::CPU);
+    b.setRequiresGrad(true);
+
+    for (size_t i = 0; i < a.numel(); ++i) {
+        a.at<float>(i) = 2.0f;
+    }
+    for (size_t i = 0; i < b.numel(); ++i) {
+        b.at<float>(i) = 3.0f;
+    }
+
+    // Broadcasting: a (1x2) - b (2x2) -> (2x2)
+    Tensor c = a - b;
+    c.backward();
+
+    ASSERT_NE(a.grad(), nullptr);
+    ASSERT_NE(b.grad(), nullptr);
+
+    // grad_a is summed over broadcast dimension
+    // grad_b is -1 (negative because subtraction)
+    for (size_t i = 0; i < a.grad()->numel(); ++i) {
+        EXPECT_FLOAT_EQ(a.grad()->at<float>(i), 2.0f);  // sum over broadcast dim
+    }
+    for (size_t i = 0; i < b.grad()->numel(); ++i) {
+        EXPECT_FLOAT_EQ(b.grad()->at<float>(i), -1.0f);
+    }
+}
+
+// Test broadcasting with multiplication
+TEST_F(AutogradTest, BackwardMethodMultiplicationBroadcasting) {
+    Tensor a({1, 2}, DType::Float32, Device::CPU);
+    a.setRequiresGrad(true);
+    Tensor b({2, 2}, DType::Float32, Device::CPU);
+    b.setRequiresGrad(true);
+
+    for (size_t i = 0; i < a.numel(); ++i) {
+        a.at<float>(i) = 2.0f;
+    }
+    for (size_t i = 0; i < b.numel(); ++i) {
+        b.at<float>(i) = 3.0f;
+    }
+
+    // Broadcasting: a (1x2) * b (2x2) -> (2x2)
+    Tensor c = a * b;
+    c.backward();
+
+    ASSERT_NE(a.grad(), nullptr);
+    ASSERT_NE(b.grad(), nullptr);
+
+    // grad_a = sum(b) over broadcast dim = 3+3 = 6
+    // grad_b = a (broadcasted) = 2
+    for (size_t i = 0; i < a.grad()->numel(); ++i) {
+        EXPECT_FLOAT_EQ(a.grad()->at<float>(i), 6.0f);  // sum over broadcast dim
+    }
+    for (size_t i = 0; i < b.grad()->numel(); ++i) {
+        EXPECT_FLOAT_EQ(b.grad()->at<float>(i), 2.0f);
+    }
+}
+
+// Test broadcasting with division
+TEST_F(AutogradTest, BackwardMethodDivisionBroadcasting) {
+    Tensor a({1, 2}, DType::Float32, Device::CPU);
+    a.setRequiresGrad(true);
+    Tensor b({2, 2}, DType::Float32, Device::CPU);
+    b.setRequiresGrad(true);
+
+    for (size_t i = 0; i < a.numel(); ++i) {
+        a.at<float>(i) = 8.0f;
+    }
+    for (size_t i = 0; i < b.numel(); ++i) {
+        b.at<float>(i) = 2.0f;
+    }
+
+    // Broadcasting: a (1x2) / b (2x2) -> (2x2)
+    Tensor c = a / b;
+    c.backward();
+
+    ASSERT_NE(a.grad(), nullptr);
+    ASSERT_NE(b.grad(), nullptr);
+
+    // grad_a = sum(1/b) over broadcast dim = 0.5+0.5 = 1.0
+    // grad_b = -a/b^2 = -8/4 = -2
+    for (size_t i = 0; i < a.grad()->numel(); ++i) {
+        EXPECT_FLOAT_EQ(a.grad()->at<float>(i), 1.0f);  // sum over broadcast dim
+    }
+    for (size_t i = 0; i < b.grad()->numel(); ++i) {
+        EXPECT_FLOAT_EQ(b.grad()->at<float>(i), -2.0f);
+    }
+}
+
+// Test broadcasting with matmul (batch broadcasting)
+TEST_F(AutogradTest, BackwardMethodMatMulBroadcasting) {
+    Tensor a({1, 2, 3}, DType::Float32, Device::CPU);
+    a.setRequiresGrad(true);
+    Tensor b({1, 3, 2}, DType::Float32, Device::CPU);
+    b.setRequiresGrad(true);
+
+    for (size_t i = 0; i < a.numel(); ++i) {
+        a.at<float>(i) = 1.0f;
+    }
+    for (size_t i = 0; i < b.numel(); ++i) {
+        b.at<float>(i) = 1.0f;
+    }
+
+    // Broadcasting matmul: a (1,2,3) @ b (1,3,2) -> (1,2,2)
+    Tensor c = a.matmul(b);
+    c.backward();
+
+    ASSERT_NE(a.grad(), nullptr);
+    ASSERT_NE(b.grad(), nullptr);
+
+    // Shapes should match original inputs (after reduction)
+    EXPECT_EQ(a.grad()->shape(), std::vector<int64_t>({1, 2, 3}));
+    EXPECT_EQ(b.grad()->shape(), std::vector<int64_t>({1, 3, 2}));
+}
+
+// Test ReLU backward
+TEST_F(AutogradTest, BackwardMethodRelu) {
+    Tensor a({2, 2}, DType::Float32, Device::CPU);
+    a.setRequiresGrad(true);
+
+    for (size_t i = 0; i < a.numel(); ++i) {
+        a.at<float>(i) = static_cast<float>(i) - 1.5f;  // Mix of positive and negative
+    }
+
+    Tensor c = a.relu();
+    c.backward();
+
+    ASSERT_NE(a.grad(), nullptr);
+
+    // ReLU gradient: 1 if input > 0, else 0
+    for (size_t i = 0; i < a.numel(); ++i) {
+        float expected_grad = (a.at<float>(i) > 0.0f) ? 1.0f : 0.0f;
+        EXPECT_FLOAT_EQ(a.grad()->at<float>(i), expected_grad);
+    }
+}
+
+// Test GELU backward
+TEST_F(AutogradTest, BackwardMethodGelu) {
+    Tensor a({2, 2}, DType::Float32, Device::CPU);
+    a.setRequiresGrad(true);
+
+    for (size_t i = 0; i < a.numel(); ++i) {
+        a.at<float>(i) = static_cast<float>(i) * 0.1f;
+    }
+
+    Tensor c = a.gelu();
+    c.backward();
+
+    ASSERT_NE(a.grad(), nullptr);
+
+    // GELU gradient should be computed correctly
+    // For small positive values, gradient should be close to 1
+    // For zero, gradient should be 0.5
+    EXPECT_NEAR(a.grad()->at<float>(0), 0.5f, 0.01f);  // x=0, grad≈0.5
+    EXPECT_GT(a.grad()->at<float>(1), 0.5f);  // x=0.1, grad>0.5
+    EXPECT_LT(a.grad()->at<float>(1), 1.0f);  // x=0.1, grad<1.0
+}
+
+// Test Sigmoid backward
+TEST_F(AutogradTest, BackwardMethodSigmoid) {
+    Tensor a({2, 2}, DType::Float32, Device::CPU);
+    a.setRequiresGrad(true);
+
+    for (size_t i = 0; i < a.numel(); ++i) {
+        a.at<float>(i) = static_cast<float>(i) * 0.1f;
+    }
+
+    Tensor c = a.sigmoid();
+    c.backward();
+
+    ASSERT_NE(a.grad(), nullptr);
+
+    // Sigmoid gradient: sigmoid(x) * (1 - sigmoid(x))
+    // For x=0, sigmoid=0.5, gradient=0.25
+    EXPECT_NEAR(a.grad()->at<float>(0), 0.25f, 0.01f);  // x=0
+    // For small positive x, gradient < 0.25
+    EXPECT_LT(a.grad()->at<float>(1), 0.25f);  // x=0.1
+}
+
+// Test activation in chain
+TEST_F(AutogradTest, BackwardMethodActivationChain) {
+    Tensor a({2, 2}, DType::Float32, Device::CPU);
+    a.setRequiresGrad(true);
+    Tensor b({2, 2}, DType::Float32, Device::CPU);
+    b.setRequiresGrad(true);
+
+    for (size_t i = 0; i < a.numel(); ++i) {
+        a.at<float>(i) = static_cast<float>(i) * 0.1f;
+        b.at<float>(i) = 1.0f;
+    }
+
+    Tensor c = (a * b).relu();
+    c.backward();
+
+    ASSERT_NE(a.grad(), nullptr);
+    ASSERT_NE(b.grad(), nullptr);
+
+    // Gradient should flow through ReLU
+    // For a*b > 0, gradient is b for a and a for b
+    // For a*b <= 0, gradient is 0
+    EXPECT_GT(a.grad()->at<float>(1), 0.0f);  // a*b > 0
+    EXPECT_FLOAT_EQ(b.grad()->at<float>(0), 0.0f);  // a*b = 0
+}
+
+// Test edge case: 1D tensor broadcasting with autograd
+TEST_F(AutogradTest, EdgeCase1DBroadcasting) {
+    Tensor a({2}, DType::Float32, Device::CPU);
+    a.setRequiresGrad(true);
+    Tensor b({2, 2}, DType::Float32, Device::CPU);
+    b.setRequiresGrad(true);
+
+    for (size_t i = 0; i < a.numel(); ++i) {
+        a.at<float>(i) = 2.0f;
+    }
+    for (size_t i = 0; i < b.numel(); ++i) {
+        b.at<float>(i) = 3.0f;
+    }
+
+    Tensor c = a + b;
+    c.backward();
+
+    ASSERT_NE(a.grad(), nullptr);
+    ASSERT_NE(b.grad(), nullptr);
+
+    // grad_a should be summed over broadcast dimension (2 positions per element)
+    for (size_t i = 0; i < a.grad()->numel(); ++i) {
+        EXPECT_FLOAT_EQ(a.grad()->at<float>(i), 2.0f);  // sum over dim 0
+    }
+    for (size_t i = 0; i < b.grad()->numel(); ++i) {
+        EXPECT_FLOAT_EQ(b.grad()->at<float>(i), 1.0f);
+    }
+}
+
+// Test edge case: zero-sized tensor gradient
+TEST_F(AutogradTest, EdgeCaseZeroGradient) {
+    Tensor a({2, 2}, DType::Float32, Device::CPU);
+    a.setRequiresGrad(true);
+    Tensor b({2, 2}, DType::Float32, Device::CPU);
+    b.setRequiresGrad(true);
+
+    for (size_t i = 0; i < a.numel(); ++i) {
+        a.at<float>(i) = 0.0f;
+        b.at<float>(i) = 1.0f;
+    }
+
+    Tensor c = a * b;
+    c.backward();
+
+    ASSERT_NE(a.grad(), nullptr);
+    ASSERT_NE(b.grad(), nullptr);
+
+    // When a is zero, grad_a should be 0 (b), grad_b should be 0 (a)
+    for (size_t i = 0; i < a.grad()->numel(); ++i) {
+        EXPECT_FLOAT_EQ(a.grad()->at<float>(i), 1.0f);
+        EXPECT_FLOAT_EQ(b.grad()->at<float>(i), 0.0f);
+    }
+}
+
+// Test edge case: large tensor with autograd
+TEST_F(AutogradTest, EdgeCaseLargeTensor) {
+    Tensor a({100, 100}, DType::Float32, Device::CPU);
+    a.setRequiresGrad(true);
+    Tensor b({100, 100}, DType::Float32, Device::CPU);
+    b.setRequiresGrad(true);
+
+    for (size_t i = 0; i < a.numel(); ++i) {
+        a.at<float>(i) = 1.0f;
+        b.at<float>(i) = 2.0f;
+    }
+
+    Tensor c = a * b;
+    c.backward();
+
+    ASSERT_NE(a.grad(), nullptr);
+    ASSERT_NE(b.grad(), nullptr);
+
+    // Check a few random positions
+    EXPECT_FLOAT_EQ(a.grad()->at<float>(0), 2.0f);
+    EXPECT_FLOAT_EQ(b.grad()->at<float>(0), 1.0f);
+    EXPECT_FLOAT_EQ(a.grad()->at<float>(5000), 2.0f);
+    EXPECT_FLOAT_EQ(b.grad()->at<float>(5000), 1.0f);
+}
+
+// Test edge case: single element tensor
+TEST_F(AutogradTest, EdgeCaseSingleElement) {
+    Tensor a({1}, DType::Float32, Device::CPU);
+    a.setRequiresGrad(true);
+    Tensor b({1}, DType::Float32, Device::CPU);
+    b.setRequiresGrad(true);
+
+    a.at<float>(0) = 3.0f;
+    b.at<float>(0) = 4.0f;
+
+    Tensor c = a * b;
+    c.backward();
+
+    ASSERT_NE(a.grad(), nullptr);
+    ASSERT_NE(b.grad(), nullptr);
+
+    EXPECT_FLOAT_EQ(a.grad()->at<float>(0), 4.0f);
+    EXPECT_FLOAT_EQ(b.grad()->at<float>(0), 3.0f);
+}
+
+// Test edge case: negative values with ReLU
+TEST_F(AutogradTest, EdgeCaseReluNegative) {
+    Tensor a({2, 2}, DType::Float32, Device::CPU);
+    a.setRequiresGrad(true);
+
+    for (size_t i = 0; i < a.numel(); ++i) {
+        a.at<float>(i) = -1.0f;  // All negative
+    }
+
+    Tensor c = a.relu();
+    c.backward();
+
+    ASSERT_NE(a.grad(), nullptr);
+
+    // All gradients should be 0 (all inputs were negative)
+    for (size_t i = 0; i < a.grad()->numel(); ++i) {
+        EXPECT_FLOAT_EQ(a.grad()->at<float>(i), 0.0f);
+    }
+}
+
+// Test edge case: very small values with sigmoid
+TEST_F(AutogradTest, EdgeCaseSigmoidSmallValues) {
+    Tensor a({2, 2}, DType::Float32, Device::CPU);
+    a.setRequiresGrad(true);
+
+    for (size_t i = 0; i < a.numel(); ++i) {
+        a.at<float>(i) = -10.0f;  // Very small
+    }
+
+    Tensor c = a.sigmoid();
+    c.backward();
+
+    ASSERT_NE(a.grad(), nullptr);
+
+    // For very small x, sigmoid(x) ≈ 0, gradient ≈ 0
+    for (size_t i = 0; i < a.grad()->numel(); ++i) {
+        EXPECT_LT(a.grad()->at<float>(i), 0.001f);
     }
 }

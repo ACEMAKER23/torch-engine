@@ -786,3 +786,87 @@ Every abstraction must justify its runtime cost.
 
 # Current Status
 
+## Completed
+
+- **Phase 1 — Tensor System**: `Tensor` / `TensorImpl` / `Storage` separation, shapes,
+  strides, offsets, zero-copy views, slicing, transpose, broadcasting. (48 tests passing)
+- **Phase 2 — CPU Tensor Operations**: elementwise `+ - * /`, unary negation, `matmul`,
+  broadcasting-aware elementwise ops, `Float32` / `Int32` / `Int64` dtypes.
+- **Phase 3 — Automatic Differentiation**: `requires_grad`, `grad`, `grad_fn`; `GradFn`
+  base class with `AddBackward`, `SubBackward`, `MulBackward`, `DivBackward`,
+  `MatMulBackward` node classes; operators build the computation graph.
+- **Phase 4 — Backward Engine**: `loss.backward()`, reverse graph traversal, gradient
+  accumulation into leaf tensors. PyTorch-style architecture (autograd metadata in `TensorImpl`).
+  (21 autograd tests passing, including chained ops)
+- **Phase 5 — Broadcasting Gradient Reduction**: Implemented `Tensor::sum(int64_t dim)` and
+  `reduce_gradient` helper. Updated all backward functions (Add, Sub, Mul, Div, MatMul) to
+  reduce gradients over broadcast dimensions. Added 8 complex autograd tests (deep nesting,
+  fan-out, broadcasting chains, matmul chains, multiple backward calls) and 4 broadcasting
+  gradient reduction tests. (33 autograd tests passing)
+- **Phase 5 — Activation Function Gradients**: Implemented `ReluBackward`, `GeluBackward`,
+  `SigmoidBackward` with correct gradient formulas. Added activation gradient tests and
+  edge case tests (1D broadcasting, zero gradients, large tensors, single element, negative
+  ReLU, small sigmoid values). (43 autograd tests passing)
+- **Data Type Optimizations**:
+  - Eliminated unnecessary memory allocations in backward functions by creating
+    template-based `unary_backward_elementwise<T>` helper
+  - Replaced runtime dtype switches with compile-time template dispatch via
+    `unary_backward_dispatch<T>` and `unary_backward` wrapper
+  - Extracted common patterns to reduce code duplication across activation backward functions
+  - Added public `Tensor::device()` accessor for device information
+
+## Key Architectural Decision (Phase 4)
+
+Autograd metadata (`requires_grad`, `grad`, `grad_fn`) lives inside the **shared**
+`TensorImpl`, not in the lightweight `Tensor` handle. This is the PyTorch
+(`Variable` / `TensorImpl` + `AutogradMeta`) model. It is what makes
+`loss.backward()` correct for chained operations — see `tensor.md` for the full
+explanation of the bug it fixes and why.
+
+## Key Implementation (Phase 5)
+
+Broadcasting gradient reduction: When a tensor is broadcast during forward pass
+(e.g., shape `[1,2]` → `[2,2]`), its gradient during backward pass must be summed
+over the broadcast dimensions to match the original shape. Implemented via
+`Tensor::sum(int64_t dim)` and `reduce_gradient` helper applied to all binary
+operation backward functions.
+
+## In Progress / Next
+
+- Phase 7 — Neural network layers (`Linear`, `Embedding`, `LayerNorm`).
+
+## Future Optimizations
+
+The following optimization opportunities have been identified but deferred for future work:
+
+1. **SIMD Vectorization for Element-Wise Operations** (MEDIUM)
+   - Current implementation uses scalar element-wise loops
+   - Could add SIMD intrinsics (x86 AVX, ARM NEON) for 2-4x speedup on large tensors
+   - Could use compiler auto-vectorization hints (`#pragma omp simd`)
+   - Consider external libraries like xsimd or oneDNN
+
+2. **In-Place Operations Where Safe** (LOW-MEDIUM)
+   - Current implementation creates new tensors for intermediate results
+   - Could use in-place operations when tensor has single reference
+   - Requires reference counting to track tensor usage
+   - Would reduce memory bandwidth and improve performance
+
+3. **Broadcasting Gradient Reduction Efficiency** (LOW)
+   - Current `reduce_gradient` sums dimensions one at a time using `Tensor::sum(dim)`
+   - Each sum creates a new tensor allocation
+   - Could implement multi-dimensional sum operation in single pass
+   - Specialize for common broadcast patterns
+
+4. **Kernel Fusion Opportunities** (MEDIUM)
+   - Chain operations like `bias + gelu` into single kernel
+   - Reduces memory traffic and kernel launch overhead
+   - Particularly important for transformer blocks
+
+## Building & Testing
+
+```bash
+cmake -S . -B build
+cmake --build build
+./build/tensor_test      # tensor system + ops (48 tests)
+./build/autograd_test    # autograd + backward engine + broadcasting reduction (43 tests)
+```

@@ -3,6 +3,8 @@
 
 #include <cstdlib>
 #include "dtype.h"
+#include <cuda_runtime.h>
+
 class Allocator{
 public:
     virtual ~Allocator() = default;
@@ -27,17 +29,22 @@ class CPUAllocator : public Allocator{
 };
 
 class CUDAAllocatorPlaceHolder : public Allocator{
-    //return a void pointer to any memory on cpu of size bytes
+    //return a void pointer to any memory on gpu of size bytes
     void* allocate(size_t bytes) override {
-        return (std::malloc(bytes));
+        void* ptr;
+        cudaError_t err = cudaMalloc(&ptr, bytes);
+        if (err != cudaSuccess) {
+            return nullptr;
+        }
+        return ptr;
     }
 
     void deallocate(void* ptr) override {
-        std::free(ptr);
+        cudaFree(ptr);
     }
 
     Device device() const override {
-        return (Device::CPU);
+        return (Device::CUDA);
     }
 };
 #endif

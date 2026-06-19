@@ -56,6 +56,8 @@ public:
 
     size_t numel() const;
 
+    Device device() const;
+
     Tensor(const Tensor& other) = default;
     Tensor(Tensor&& other) noexcept = default;
     Tensor& operator=(const Tensor& other) = default;
@@ -89,10 +91,10 @@ public:
     Tensor operator-() const;
     //--------------//
 
-    bool requiredGrad() const {return requiresGrad_;};
-    std::shared_ptr<Tensor> grad() const {return grad_;};
-    std::shared_ptr<GradFn> gradFn() const {return gradFn_;};
-    void setRequiresGrad(bool value) {requiresGrad_ = value;};
+    bool requiredGrad() const {return impl_->requires_grad();};
+    std::shared_ptr<Tensor> grad() const {return impl_->grad();};
+    std::shared_ptr<GradFn> gradFn() const {return impl_->grad_fn();};
+    void setRequiresGrad(bool value) {impl_->set_requires_grad(value);};
 
     Tensor relu();
     Tensor gelu();
@@ -266,6 +268,9 @@ public:
         }
         return result;
     }
+
+    // Sum over a specific dimension, reducing the rank by 1
+    Tensor sum(int64_t dim) const;
 
     template<typename T>
     T mean() {
@@ -588,19 +593,15 @@ public:
 
 private:
     std::shared_ptr<TensorImpl> impl_;
-    //determine whether this tensor hold the gradient
-    bool requiresGrad_;
-    //the gradient of the loss function with respect to this specific function
-    //only exit if requiredGrad_ is true;
-    std::shared_ptr<Tensor> grad_;
-    //the function that created the tensor.
-    std::shared_ptr<GradFn> gradFn_;
 
     Tensor(shared_ptr<Storage> store, const std::vector<int64_t>& shape, DType dtype);
     Tensor(shared_ptr<TensorImpl> tImple);
 
     //server face function that actually compute the gradient
     void backward_impl(const Tensor& passedDownGrad);
+
+    template<typename T>
+    void sum_impl(Tensor& result, int64_t dim) const;
 };
 
 

@@ -10,8 +10,10 @@ public:
     //in terms of all the input to the function
     virtual std::vector<Tensor> backward(const Tensor& pastDownGrad)=0;
 
-    //vector that hold all the tensor that are input to the function
-    std::vector<Tensor*> inputs;
+    //vector that hold all the tensor that are input to the function.
+    //Stored by value: each Tensor shares its TensorImpl (data + autograd state)
+    //with the original, and keeps the autograd graph alive via shared_ptr.
+    std::vector<Tensor> inputs;
 };
 
 class AddBackward : public GradFn{
@@ -35,5 +37,20 @@ public:
 class DivBackward : public GradFn {
 public:
     std::vector<Tensor> backward(const Tensor& PathDownGrad) override;
+};
+
+class ReluBackward : public GradFn {
+public:
+    std::vector<Tensor> backward(const Tensor& pathDownGrad) override;
+};
+
+class GeluBackward : public GradFn {
+public:
+    std::vector<Tensor> backward(const Tensor& pathDownGrad) override;
+};
+
+class SigmoidBackward : public GradFn {
+public:
+    std::vector<Tensor> backward(const Tensor& pathDownGrad) override;
 };
 #endif
