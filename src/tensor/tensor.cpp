@@ -278,7 +278,7 @@ Tensor Tensor::transpose_view(size_t d1, size_t d2) const {
 }
 
 // Non-inplace versions (create new tensors and return them)
-Tensor Tensor::relu() {
+Tensor Tensor::relu() const {
     Tensor result = clone();
     switch (impl_->dtype()) {
         case DType::Float32:
@@ -302,7 +302,7 @@ Tensor Tensor::relu() {
     return result;
 }
 
-Tensor Tensor::gelu() {
+Tensor Tensor::gelu() const {
     Tensor result = clone();
     switch (impl_->dtype()) {
         case DType::Float32:
@@ -328,7 +328,7 @@ Tensor Tensor::gelu() {
 
 // Stub implementations for remaining activations
 
-Tensor Tensor::sigmoid() {
+Tensor Tensor::sigmoid() const {
     Tensor result = clone();
     switch (impl_->dtype()) {
         case DType::Float32:
@@ -352,7 +352,7 @@ Tensor Tensor::sigmoid() {
     return result;
 }
 
-Tensor Tensor::sqrt() {
+Tensor Tensor::sqrt() const {
     Tensor result = clone();
     switch (impl_->dtype()) {
         case DType::Float32:
@@ -370,7 +370,7 @@ Tensor Tensor::sqrt() {
     return result;
 }
 
-Tensor Tensor::exp() {
+Tensor Tensor::exp() const {
     Tensor result = clone();
     switch (impl_->dtype()) {
         case DType::Float32:
@@ -388,7 +388,7 @@ Tensor Tensor::exp() {
     return result;
 }
 
-Tensor Tensor::log() {
+Tensor Tensor::log() const {
     Tensor result = clone();
     switch (impl_->dtype()) {
         case DType::Float32:

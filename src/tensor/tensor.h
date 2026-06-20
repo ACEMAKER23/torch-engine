@@ -96,12 +96,12 @@ public:
     std::shared_ptr<GradFn> gradFn() const {return impl_->grad_fn();};
     void setRequiresGrad(bool value) {impl_->set_requires_grad(value);};
 
-    Tensor relu();
-    Tensor gelu();
-    Tensor sigmoid();
-    Tensor sqrt();
-    Tensor exp();
-    Tensor log();
+    Tensor relu() const;
+    Tensor gelu() const;
+    Tensor sigmoid() const;
+    Tensor sqrt() const;
+    Tensor exp() const;
+    Tensor log() const;
     // pow is implemented as template below
 
     // Template implementations (must be in header)
@@ -112,18 +112,19 @@ public:
         // Returns the broadcasted shape (should equal target_shape if compatible)
         size_t ndim = shape.size();
         size_t target_ndim = target_shape.size();
+        size_t max_ndim = std::max(ndim, target_ndim);
         
-        std::vector<int64_t> result(target_ndim);
+        std::vector<int64_t> result(max_ndim);
         
-        for (size_t i = 0; i < target_ndim; ++i) {
+        for (size_t i = 0; i < max_ndim; ++i) {
             int64_t dim = (i < ndim) ? shape[ndim - 1 - i] : 1;
-            int64_t target_dim = target_shape[target_ndim - 1 - i];
+            int64_t target_dim = (i < target_ndim) ? target_shape[target_ndim - 1 - i] : 1;
             
             if (dim != target_dim && dim != 1 && target_dim != 1) {
                 throw runtime_error("Shapes are not broadcastable");
             };
             
-            result[target_ndim - 1 - i] = std::max(dim, target_dim);
+            result[max_ndim - 1 - i] = std::max(dim, target_dim);
         }
         
         return result;
