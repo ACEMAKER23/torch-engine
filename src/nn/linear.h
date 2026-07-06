@@ -2,17 +2,18 @@
 #define LINEAR
 
 #include "../tensor/tensor.h"
+#include "module.h"
 
-class Linear{
+class Linear : public Module {
 public:
     Linear(int64_t inFeatures, int64_t outFeatures, DType dtype);
-    Tensor forward(const Tensor& input);
+    Tensor forward(const Tensor& input) override;
 
     const Tensor& bias() const {return bias_;};
     const Tensor& weight() const {return weight_;};
     
-    std::vector<Tensor> parameters();
-    void zero_grad();
+    std::vector<Tensor> parameters() override;
+    void zero_grad() override;
 
 private: 
     int64_t inFeatures_;

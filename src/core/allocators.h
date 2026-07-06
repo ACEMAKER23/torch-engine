@@ -3,7 +3,10 @@
 
 #include <cstdlib>
 #include "dtype.h"
+
+#ifdef USE_CUDA
 #include <cuda_runtime.h>
+#endif
 
 class Allocator{
 public:
@@ -28,6 +31,7 @@ class CPUAllocator : public Allocator{
     }
 };
 
+#ifdef USE_CUDA
 class CUDAAllocatorPlaceHolder : public Allocator{
     //return a void pointer to any memory on gpu of size bytes
     void* allocate(size_t bytes) override {
@@ -47,4 +51,5 @@ class CUDAAllocatorPlaceHolder : public Allocator{
         return (Device::CUDA);
     }
 };
+#endif
 #endif

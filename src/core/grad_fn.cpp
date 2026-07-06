@@ -172,3 +172,123 @@ std::vector<Tensor> SigmoidBackward::backward(const Tensor& pathDownGrad) {
     return {grad};
 }
 
+std::vector<Tensor> CrossEntropyBackward::backward(const Tensor& pathDownGrad) {
+    // PyTorch-style gradient: softmax(logits) - one_hot(target)
+    // inputs[0] = logits, inputs[1] = target class indices
+
+    const Tensor& logits = inputs[0];
+    const Tensor& targets = inputs[1];
+    int64_t target_class = targets.at<int64_t>(0);
+
+    // Compute softmax
+    float max_logit = logits.at<float>(0);
+    for (size_t i = 1; i < logits.numel(); ++i) {
+        max_logit = std::max(max_logit, logits.at<float>(i));
+    }
+
+    float sum_exp = 0.0f;
+    for (size_t i = 0; i < logits.numel(); ++i) {
+        sum_exp += std::exp(logits.at<float>(i) - max_logit);
+    }
+
+    Tensor grad(logits.shape(), logits.dtype(), logits.device());
+
+    for (size_t i = 0; i < logits.numel(); ++i) {
+        float softmax_val = std::exp(logits.at<float>(i) - max_logit) / sum_exp;
+        float one_hot = (i == target_class) ? 1.0f : 0.0f;
+        grad.at<float>(i) = softmax_val - one_hot;
+    }
+
+    grad.setRequiresGrad(false);
+    return {grad};
+}
+
+std::vector<Tensor> CrossEntropyWithProbsBackward::backward(const Tensor& pathDownGrad) {
+    // Gradient for probability-based loss: -1/p for target class, 0 otherwise
+    // inputs[0] = probabilities, inputs[1] = target class indices
+
+    const Tensor& probabilities = inputs[0];
+    const Tensor& targets = inputs[1];
+    int64_t target_class = targets.at<int64_t>(0);
+
+    Tensor grad(probabilities.shape(), probabilities.dtype(), probabilities.device());
+
+    for (size_t i = 0; i < probabilities.numel(); ++i) {
+        if (i == target_class) {
+            grad.at<float>(i) = -1.0f / probabilities.at<float>(i);
+        } else {
+            grad.at<float>(i) = 0.0f;
+        }
+    }
+
+    grad.setRequiresGrad(false);
+    return {grad};
+}
+
+std::vector<Tensor> MSEBackward::backward(const Tensor& pathDownGrad) {
+    // MSE gradient: 2 * (predictions - targets) / n
+    // inputs[0] = predictions, inputs[1] = targets
+
+    const Tensor& predictions = inputs[0];
+    const Tensor& targets = inputs[1];
+
+    Tensor diff = predictions - targets;
+    float n = static_cast<float>(predictions.numel());
+    float scale = 2.0f / n;
+
+    Tensor grad(diff.shape(), diff.dtype(), diff.device());
+
+    for (size_t i = 0; i < diff.numel(); ++i) {
+        grad.at<float>(i) = diff.at<float>(i) * scale;
+    }
+
+    grad.setRequiresGrad(false);
+    return {grad};
+}
+
+std::vector<Tensor> BCEBackward::backward(const Tensor& pathDownGrad) {
+    // BCE gradient: (predictions - targets) / (predictions * (1 - predictions))
+    // inputs[0] = predictions (probabilities), inputs[1] = targets (0 or 1)
+
+    const Tensor& predictions = inputs[0];
+    const Tensor& targets = inputs[1];
+
+    Tensor grad(predictions.shape(), predictions.dtype(), predictions.device());
+
+    for (size_t i = 0; i < predictions.numel(); ++i) {
+        float p = predictions.at<float>(i);
+        float t = targets.at<float>(i);
+        // Avoid division by zero
+        float denom = p * (1.0f - p);
+        if (std::abs(denom) < 1e-7f) {
+            grad.at<float>(i) = 0.0f;
+        } else {
+            grad.at<float>(i) = (p - t) / denom;
+        }
+    }
+
+    grad.setRequiresGrad(false);
+    return {grad};
+}
+
+std::vector<Tensor> L1Backward::backward(const Tensor& pathDownGrad) {
+    // L1 gradient: sign(predictions - targets) / n
+    // inputs[0] = predictions, inputs[1] = targets
+
+    const Tensor& predictions = inputs[0];
+    const Tensor& targets = inputs[1];
+
+    Tensor diff = predictions - targets;
+    float n = static_cast<float>(predictions.numel());
+
+    Tensor grad(diff.shape(), diff.dtype(), diff.device());
+
+    for (size_t i = 0; i < diff.numel(); ++i) {
+        float d = diff.at<float>(i);
+        grad.at<float>(i) = (d > 0.0f) ? 1.0f / n : ((d < 0.0f) ? -1.0f / n : 0.0f);
+    }
+
+    grad.setRequiresGrad(false);
+    return {grad};
+}
+

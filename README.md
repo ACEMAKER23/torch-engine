@@ -789,7 +789,7 @@ Every abstraction must justify its runtime cost.
 ## Completed
 
 - **Phase 1 — Tensor System**: `Tensor` / `TensorImpl` / `Storage` separation, shapes,
-  strides, offsets, zero-copy views, slicing, transpose, broadcasting. (48 tests passing)
+  strides, offsets, zero-copy views, slicing, transpose, broadcasting. (58 tests passing)
 - **Phase 2 — CPU Tensor Operations**: elementwise `+ - * /`, unary negation, `matmul`,
   broadcasting-aware elementwise ops, `Float32` / `Int32` / `Int64` dtypes.
 - **Phase 3 — Automatic Differentiation**: `requires_grad`, `grad`, `grad_fn`; `GradFn`
@@ -797,23 +797,31 @@ Every abstraction must justify its runtime cost.
   `MatMulBackward` node classes; operators build the computation graph.
 - **Phase 4 — Backward Engine**: `loss.backward()`, reverse graph traversal, gradient
   accumulation into leaf tensors. PyTorch-style architecture (autograd metadata in `TensorImpl`).
-  (21 autograd tests passing, including chained ops)
-- **Phase 5 — Broadcasting Gradient Reduction**: Implemented `Tensor::sum(int64_t dim)` and
-  `reduce_gradient` helper. Updated all backward functions (Add, Sub, Mul, Div, MatMul) to
-  reduce gradients over broadcast dimensions. Added 8 complex autograd tests (deep nesting,
-  fan-out, broadcasting chains, matmul chains, multiple backward calls) and 4 broadcasting
-  gradient reduction tests. (33 autograd tests passing)
-- **Phase 5 — Activation Function Gradients**: Implemented `ReluBackward`, `GeluBackward`,
-  `SigmoidBackward` with correct gradient formulas. Added activation gradient tests and
-  edge case tests (1D broadcasting, zero gradients, large tensors, single element, negative
-  ReLU, small sigmoid values). (43 autograd tests passing)
-- **Data Type Optimizations**:
-  - Eliminated unnecessary memory allocations in backward functions by creating
-    template-based `unary_backward_elementwise<T>` helper
-  - Replaced runtime dtype switches with compile-time template dispatch via
-    `unary_backward_dispatch<T>` and `unary_backward` wrapper
-  - Extracted common patterns to reduce code duplication across activation backward functions
-  - Added public `Tensor::device()` accessor for device information
+  (43 autograd tests passing, including chained ops)
+- **Phase 5 — CPU Autograd & Broadcasting**:
+  - Broadcasting gradient reduction: Implemented `Tensor::sum(int64_t dim)` and
+    `reduce_gradient` helper. Updated all backward functions (Add, Sub, Mul, Div, MatMul) to
+    reduce gradients over broadcast dimensions.
+  - Activation function gradients: Implemented `ReluBackward`, `GeluBackward`,
+    `SigmoidBackward` with correct gradient formulas.
+  - Data type optimizations: Eliminated memory allocations, template-based dispatch,
+    reduced code duplication.
+  - Test coverage: 43 autograd tests passing (including complex tests, broadcasting
+    reduction tests, activation tests, edge case tests).
+- **Phase 7 — Neural Network Components**: All major components implemented on CPU
+  - `Module` base class with `forward()`, `parameters()`, `zero_grad()` interface
+  - `Linear` layer: Fully connected layer with weight/bias parameters, Xavier initialization
+  - `Embedding` layer: Token embedding lookup with learnable weights
+  - `LayerNorm`: Layer normalization with learnable weight/bias
+  - `Dropout`: Random neuron dropout with training/inference modes
+  - `Sequential`: Container for stacking layers
+  - `Residual`: Residual connection wrapper
+  - Test coverage: 51 tests passing (10 linear + 22 nn_layers + 19 attention)
+- **Phase 8 — Transformer Architecture (Partial)**:
+  - `ScaledDot`: Scaled dot-product attention with softmax
+  - `MultiHeadAttention`: Multi-head attention with Q/K/V projections
+  - `PositionalEmbedding`: Sinusoidal positional embeddings
+  - Missing: Feed Forward Network, complete Transformer block, GPT model
 
 ## Key Architectural Decision (Phase 4)
 
@@ -831,9 +839,34 @@ over the broadcast dimensions to match the original shape. Implemented via
 `Tensor::sum(int64_t dim)` and `reduce_gradient` helper applied to all binary
 operation backward functions.
 
+## Not Yet Started
+
+- **Phase 5 — CUDA Infrastructure**: Device abstraction, GPU memory management (CUDA kernels exist but not integrated)
+- **Phase 6 — CUDA Kernels**: GPU elementwise ops, reductions, matmul (kernels exist but not integrated)
+- **Phase 8 — Transformer Architecture (Complete)**: Feed Forward Network, Transformer block, GPT model
+- **Phase 9 — Optimizers**: SGD, Adam, AdamW
+- **Phase 10 — Mixed Precision Training**: FP16/BF16 support
+- **Phase 11 — LLM-Specific Optimization**: Memory pools, kernel fusion, Flash Attention, CUDA graphs
+- **Phase 12 — Distributed Training**: Data parallelism, tensor parallelism, pipeline parallelism
+
 ## In Progress / Next
 
-- Phase 7 — Neural network layers (`Linear`, `Embedding`, `LayerNorm`).
+Decision point: Choose next phase
+- **Option A**: Phase 5-6 (CUDA Infrastructure & Kernels) - Integrate existing CUDA kernels
+- **Option B**: Phase 8 (Complete Transformer Architecture) - Build Feed Forward Network and GPT model
+- **Option C**: Phase 9 (Optimizers) - Implement SGD, Adam, AdamW for training
+
+## Building & Testing
+
+```bash
+cmake -S . -B build
+cmake --build build
+./build/tensor_test       # tensor system + ops (58 tests)
+./build/autograd_test     # autograd + backward engine (43 tests)
+./build/linear_test       # linear layer tests (10 tests)
+./build/nn_layers_test    # neural network layers (22 tests)
+./build/attention_test    # attention mechanisms (19 tests)
+```
 
 ## Future Optimizations
 

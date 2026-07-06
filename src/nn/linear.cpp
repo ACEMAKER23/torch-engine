@@ -52,6 +52,10 @@ std::vector<Tensor> Linear::parameters() {
 }
 
 void Linear::zero_grad() {
-    // Gradients are cleared by the tensor implementation during backward
-    // This is a placeholder for future gradient clearing logic
+    if (weight_.grad() && weight_.dtype() == DType::Float32) {
+        weight_.grad()->fill_<float>(0.0f);
+    }
+    if (bias_.grad() && bias_.dtype() == DType::Float32) {
+        bias_.grad()->fill_<float>(0.0f);
+    }
 }

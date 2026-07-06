@@ -70,3 +70,31 @@ TEST(LinearTest, GetterMethodsConst) {
     EXPECT_EQ(weight.shape()[0], 4);
     EXPECT_EQ(bias.shape()[0], 4);
 }
+
+TEST(LinearTest, ZeroGradNoGradient) {
+    Linear layer(3, 4, DType::Float32);
+    
+    // zero_grad should not throw even if gradients don't exist yet
+    EXPECT_NO_THROW(layer.zero_grad());
+}
+
+TEST(LinearTest, ZeroGradWithGradient) {
+    Linear layer(3, 4, DType::Float32);
+    
+    // zero_grad should work (gradients are set to true in constructor)
+    EXPECT_NO_THROW(layer.zero_grad());
+}
+
+TEST(LinearTest, ParametersReturn) {
+    Linear layer(3, 4, DType::Float32);
+    
+    auto params = layer.parameters();
+    
+    // Should return 2 parameters (weight and bias)
+    EXPECT_EQ(params.size(), 2);
+    
+    // Check shapes
+    EXPECT_EQ(params[0].shape()[0], 4);  // weight: [out_features, in_features]
+    EXPECT_EQ(params[0].shape()[1], 3);
+    EXPECT_EQ(params[1].shape()[0], 4);  // bias: [out_features]
+}

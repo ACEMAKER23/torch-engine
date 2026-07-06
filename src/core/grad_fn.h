@@ -53,4 +53,29 @@ class SigmoidBackward : public GradFn {
 public:
     std::vector<Tensor> backward(const Tensor& pathDownGrad) override;
 };
+
+class CrossEntropyBackward : public GradFn {
+public:
+    std::vector<Tensor> backward(const Tensor& pathDownGrad) override;
+};
+
+class CrossEntropyWithProbsBackward : public GradFn {
+public:
+    std::vector<Tensor> backward(const Tensor& pathDownGrad) override;
+};
+
+class MSEBackward : public GradFn {
+public:
+    std::vector<Tensor> backward(const Tensor& pathDownGrad) override;
+};
+
+class BCEBackward : public GradFn {
+public:
+    std::vector<Tensor> backward(const Tensor& pathDownGrad) override;
+};
+
+class L1Backward : public GradFn {
+public:
+    std::vector<Tensor> backward(const Tensor& pathDownGrad) override;
+};
 #endif

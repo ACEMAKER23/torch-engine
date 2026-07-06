@@ -65,6 +65,7 @@ public:
 
 
     Tensor clone() const;
+    Tensor contiguous() const;
 
     void view(const vector<int64_t>& newShape);
     void transpose();
@@ -95,6 +96,7 @@ public:
     std::shared_ptr<Tensor> grad() const {return impl_->grad();};
     std::shared_ptr<GradFn> gradFn() const {return impl_->grad_fn();};
     void setRequiresGrad(bool value) {impl_->set_requires_grad(value);};
+    void setGradFn(std::shared_ptr<GradFn> fn) {impl_->set_grad_fn(fn);};
 
     Tensor relu() const;
     Tensor gelu() const;
@@ -102,7 +104,10 @@ public:
     Tensor sqrt() const;
     Tensor exp() const;
     Tensor log() const;
-    // pow is implemented as template below
+    
+    template<typename T>
+    Tensor softmax(int64_t dim);
+    Tensor softmax(int64_t dim);
 
     // Template implementations (must be in header)
     template<typename T>
@@ -387,6 +392,15 @@ public:
         for (size_t i = 0; i < numel(); i++) {
             size_t idx = impl_->offset() + i;
             data[idx] = static_cast<T>(std::log(static_cast<double>(data[idx])));
+        }
+    }
+
+    template<typename T>
+    void fill_(T value) {
+        auto* data = static_cast<T*>(impl_->storage()->data());
+        for (size_t i = 0; i < numel(); i++) {
+            size_t idx = impl_->offset() + i;
+            data[idx] = value;
         }
     }
 

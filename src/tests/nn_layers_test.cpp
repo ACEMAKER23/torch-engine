@@ -4,6 +4,8 @@
 #include "../nn/dropout.h"
 #include "../nn/relu.h"
 #include "../nn/gelu.h"
+#include "../nn/sequential.h"
+#include "../nn/linear.h"
 #include "../tensor/tensor.h"
 #include "../core/dtype.h"
 
@@ -194,4 +196,23 @@ TEST(GeLUTest, ForwardPass) {
     // GeLU should be smooth and approximately linear for positive values
     EXPECT_GT(output_data[2], 0.0f);
     EXPECT_GT(output_data[3], 0.0f);
+}
+
+TEST(SequentialTest, BasicLayers) {
+    Sequential seq;
+    seq.add(std::make_shared<Linear>(4, 8, DType::Float32));
+    seq.add(std::make_shared<ReLU>());
+    seq.add(std::make_shared<Linear>(8, 4, DType::Float32));
+    
+    // Create input tensor
+    Tensor input({2, 4}, DType::Float32, Device::CPU);
+    auto* input_data = static_cast<float*>(input.data());
+    input_data[0] = 1.0f; input_data[1] = 2.0f; input_data[2] = 3.0f; input_data[3] = 4.0f;
+    input_data[4] = 5.0f; input_data[5] = 6.0f; input_data[6] = 7.0f; input_data[7] = 8.0f;
+    
+    Tensor output = seq.forward(input);
+    
+    // Output should have same shape as input [2, 4]
+    EXPECT_EQ(output.shape()[0], 2);
+    EXPECT_EQ(output.shape()[1], 4);
 }

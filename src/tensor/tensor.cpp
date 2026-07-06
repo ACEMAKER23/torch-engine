@@ -21,7 +21,11 @@ Tensor::Tensor(std::vector<int64_t> shape, DType dtype, Device deviceT){
     for(int64_t sh : shape) s*=sh;
     std::shared_ptr<Allocator> allocator;
     if (deviceT == Device::CUDA) {
+#ifdef USE_CUDA
         allocator = std::make_shared<CUDAAllocatorPlaceHolder>();
+#else
+        throw std::runtime_error("CUDA not supported in this build");
+#endif
     } else {
         allocator = std::make_shared<CPUAllocator>();
     }
@@ -53,6 +57,57 @@ Tensor Tensor::clone() const{
 
 
     return (Tensor(storage,impl_->shape(),dty));
+}
+
+Tensor Tensor::contiguous() const {
+    // Create a new tensor with contiguous memory layout
+    // This is similar to clone() but ensures proper strides
+    size_t numElements = impl_->numel();
+    size_t elementSize = 0;
+    
+    switch (impl_->dtype()) {
+        case DType::Float32:
+            elementSize = sizeof(float);
+            break;
+        case DType::Int32:
+            elementSize = sizeof(int32_t);
+            break;
+        case DType::Int64:
+            elementSize = sizeof(int64_t);
+            break;
+        default:
+            throw runtime_error("Unsupported dtype for contiguous");
+    }
+    
+    size_t totalBytes = numElements * elementSize;
+    auto allocator = impl_->storage()->allocator();
+    auto storage = Storage::allocate(totalBytes, allocator);
+    
+    // Copy data element-wise to ensure contiguity
+    const void* srcData = impl_->storage()->data();
+    void* dstData = storage->data();
+    
+    if (impl_->dtype() == DType::Float32) {
+        const float* src = static_cast<const float*>(srcData);
+        float* dst = static_cast<float*>(dstData);
+        for (size_t i = 0; i < numElements; ++i) {
+            dst[i] = src[i];
+        }
+    } else if (impl_->dtype() == DType::Int32) {
+        const int32_t* src = static_cast<const int32_t*>(srcData);
+        int32_t* dst = static_cast<int32_t*>(dstData);
+        for (size_t i = 0; i < numElements; ++i) {
+            dst[i] = src[i];
+        }
+    } else if (impl_->dtype() == DType::Int64) {
+        const int64_t* src = static_cast<const int64_t*>(srcData);
+        int64_t* dst = static_cast<int64_t*>(dstData);
+        for (size_t i = 0; i < numElements; ++i) {
+            dst[i] = src[i];
+        }
+    }
+    
+    return Tensor(storage, impl_->shape(), impl_->dtype());
 }
 
 void Tensor::view(const vector<int64_t>& newShape){
@@ -571,5 +626,93 @@ void Tensor::backward_impl(const Tensor& passedDownGrad){
                 currentPre.push({input,inputGradent[i]});
             }
         }
+    }
+}
+
+
+template <typename T>
+Tensor Tensor::softmax(int64_t dim) {
+    Tensor out = clone();
+
+    auto shape = out.shape();
+    int64_t ndim = shape.size();
+    if (dim < 0) dim += ndim;
+    if (dim < 0 || dim >= ndim)
+        throw std::runtime_error("Invalid softmax dim");
+
+    auto* data = static_cast<T*>(out.data());
+
+
+    int64_t dim_size = shape[dim];
+    int64_t outer_size = out.numel() / dim_size;
+
+    // We iterate over all "outer" indices (all dims except `dim`)
+    std::vector<int64_t> idx(ndim, 0);
+
+    for (int64_t outer = 0; outer < outer_size; ++outer) {
+
+        // decode outer index into multidimensional index (except dim)
+        int64_t tmp = outer;
+        for (int i = ndim - 1; i >= 0; --i) {
+            if (i == dim) continue;
+            idx[i] = tmp % shape[i];
+            tmp /= shape[i];
+        }
+
+        // -----------------------------
+        // Step 1: find max (stability)
+        // -----------------------------
+        T max_val = -std::numeric_limits<T>::infinity();
+
+        for (int64_t i = 0; i < dim_size; ++i) {
+            idx[dim] = i;
+
+            int64_t offset = 0;
+            for (int d = 0; d < ndim; ++d)
+                offset += idx[d] * strides()[d];
+
+            max_val = std::max(max_val, data[offset]);
+        }
+
+        // -----------------------------
+        // Step 2: exp + sum
+        // -----------------------------
+        T sum = 0;
+
+        for (int64_t i = 0; i < dim_size; ++i) {
+            idx[dim] = i;
+
+            int64_t offset = 0;
+            for (int d = 0; d < ndim; ++d)
+                offset += idx[d] * strides()[d];
+
+            T val = std::exp(data[offset] - max_val);
+            data[offset] = val;
+            sum += val;
+        }
+
+        // -----------------------------
+        // Step 3: normalize
+        // -----------------------------
+        for (int64_t i = 0; i < dim_size; ++i) {
+            idx[dim] = i;
+
+            int64_t offset = 0;
+            for (int d = 0; d < ndim; ++d)
+                offset += idx[d] * strides()[d];
+
+            data[offset] /= sum;
+        }
+    }
+
+    return out;
+}
+
+Tensor Tensor::softmax(int64_t dim) {
+    switch (impl_->dtype()) {
+        case DType::Float32:
+            return softmax<float>(dim);
+        default:
+            throw std::runtime_error("Softmax only supports float types");
     }
 }

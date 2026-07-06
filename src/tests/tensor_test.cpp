@@ -809,6 +809,190 @@ TEST(TensorTest, ElementwiseBroadcastIncompatible) {
     EXPECT_THROW(a + b, std::runtime_error);
 }
 
+TEST(TensorTest, FillFloat32) {
+    Tensor a({2, 3}, DType::Float32, Device::CPU);
+    
+    a.fill_<float>(5.0f);
+    
+    float* data = static_cast<float*>(a.data());
+    for (size_t i = 0; i < a.numel(); ++i) {
+        EXPECT_FLOAT_EQ(data[i], 5.0f);
+    }
+}
+
+TEST(TensorTest, FillInt32) {
+    Tensor a({2, 3}, DType::Int32, Device::CPU);
+    
+    a.fill_<int32_t>(42);
+    
+    int32_t* data = static_cast<int32_t*>(a.data());
+    for (size_t i = 0; i < a.numel(); ++i) {
+        EXPECT_EQ(data[i], 42);
+    }
+}
+
+TEST(TensorTest, FillInt64) {
+    Tensor a({2, 3}, DType::Int64, Device::CPU);
+    
+    a.fill_<int64_t>(100);
+    
+    int64_t* data = static_cast<int64_t*>(a.data());
+    for (size_t i = 0; i < a.numel(); ++i) {
+        EXPECT_EQ(data[i], 100);
+    }
+}
+
+TEST(TensorTest, FillZero) {
+    Tensor a({2, 3}, DType::Float32, Device::CPU);
+    
+    // Initialize with some values
+    float* data = static_cast<float*>(a.data());
+    for (size_t i = 0; i < a.numel(); ++i) {
+        data[i] = static_cast<float>(i);
+    }
+    
+    // Fill with zero
+    a.fill_<float>(0.0f);
+    
+    for (size_t i = 0; i < a.numel(); ++i) {
+        EXPECT_FLOAT_EQ(data[i], 0.0f);
+    }
+}
+
+TEST(TensorTest, ContiguousBasic) {
+    Tensor a({2, 3}, DType::Float32, Device::CPU);
+    
+    // Initialize with some values
+    float* data = static_cast<float*>(a.data());
+    for (size_t i = 0; i < a.numel(); ++i) {
+        data[i] = static_cast<float>(i);
+    }
+    
+    Tensor b = a.contiguous();
+    
+    // Check shape is preserved
+    EXPECT_EQ(b.shape()[0], 2);
+    EXPECT_EQ(b.shape()[1], 3);
+    
+    // Check data is copied correctly
+    const float* b_data = static_cast<const float*>(b.data());
+    for (size_t i = 0; i < b.numel(); ++i) {
+        EXPECT_FLOAT_EQ(b_data[i], static_cast<float>(i));
+    }
+    
+    // Modify original and check contiguous copy is unchanged (proves it's a deep copy)
+    data[0] = 999.0f;
+    EXPECT_FLOAT_EQ(b_data[0], 0.0f);
+}
+
+TEST(TensorTest, ContiguousAfterTranspose) {
+    Tensor a({2, 3}, DType::Float32, Device::CPU);
+    
+    // Initialize with some values
+    float* data = static_cast<float*>(a.data());
+    for (size_t i = 0; i < a.numel(); ++i) {
+        data[i] = static_cast<float>(i);
+    }
+    
+    // Transpose the tensor
+    a.transpose(0, 1);
+    
+    // Make it contiguous
+    Tensor b = a.contiguous();
+    
+    // Check shape is [3, 2] after transpose
+    EXPECT_EQ(b.shape()[0], 3);
+    EXPECT_EQ(b.shape()[1], 2);
+    
+    // Check data is accessible
+    const float* b_data = static_cast<const float*>(b.data());
+    EXPECT_EQ(b.numel(), 6);
+}
+
+TEST(TensorTest, ContiguousInt32) {
+    Tensor a({2, 3}, DType::Int32, Device::CPU);
+    
+    // Initialize with some values
+    int32_t* data = static_cast<int32_t*>(a.data());
+    for (size_t i = 0; i < a.numel(); ++i) {
+        data[i] = static_cast<int32_t>(i);
+    }
+    
+    Tensor b = a.contiguous();
+    
+    // Check shape is preserved
+    EXPECT_EQ(b.shape()[0], 2);
+    EXPECT_EQ(b.shape()[1], 3);
+    
+    // Check data is copied correctly
+    const int32_t* b_data = static_cast<const int32_t*>(b.data());
+    for (size_t i = 0; i < b.numel(); ++i) {
+        EXPECT_EQ(b_data[i], static_cast<int32_t>(i));
+    }
+}
+
+TEST(TensorTest, ContiguousInt64) {
+    Tensor a({2, 3}, DType::Int64, Device::CPU);
+    
+    // Initialize with some values
+    int64_t* data = static_cast<int64_t*>(a.data());
+    for (size_t i = 0; i < a.numel(); ++i) {
+        data[i] = static_cast<int64_t>(i);
+    }
+    
+    Tensor b = a.contiguous();
+    
+    // Check shape is preserved
+    EXPECT_EQ(b.shape()[0], 2);
+    EXPECT_EQ(b.shape()[1], 3);
+    
+    // Check data is copied correctly
+    const int64_t* b_data = static_cast<const int64_t*>(b.data());
+    for (size_t i = 0; i < b.numel(); ++i) {
+        EXPECT_EQ(b_data[i], static_cast<int64_t>(i));
+    }
+}
+
+TEST(TensorTest, Contiguous1D) {
+    Tensor a({5}, DType::Float32, Device::CPU);
+    
+    float* data = static_cast<float*>(a.data());
+    for (size_t i = 0; i < a.numel(); ++i) {
+        data[i] = static_cast<float>(i);
+    }
+    
+    Tensor b = a.contiguous();
+    
+    EXPECT_EQ(b.shape()[0], 5);
+    EXPECT_EQ(b.numel(), 5);
+    
+    const float* b_data = static_cast<const float*>(b.data());
+    for (size_t i = 0; i < b.numel(); ++i) {
+        EXPECT_FLOAT_EQ(b_data[i], static_cast<float>(i));
+    }
+}
+
+TEST(TensorTest, Contiguous3D) {
+    Tensor a({2, 3, 4}, DType::Float32, Device::CPU);
+    
+    float* data = static_cast<float*>(a.data());
+    for (size_t i = 0; i < a.numel(); ++i) {
+        data[i] = static_cast<float>(i);
+    }
+    
+    Tensor b = a.contiguous();
+    
+    EXPECT_EQ(b.shape()[0], 2);
+    EXPECT_EQ(b.shape()[1], 3);
+    EXPECT_EQ(b.shape()[2], 4);
+    EXPECT_EQ(b.numel(), 24);
+    
+    const float* b_data = static_cast<const float*>(b.data());
+    for (size_t i = 0; i < b.numel(); ++i) {
+        EXPECT_FLOAT_EQ(b_data[i], static_cast<float>(i));
+    }
+}
+
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
