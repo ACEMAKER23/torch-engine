@@ -53,7 +53,9 @@ set(TENSOR_SOURCES
 
 # Add CUDA sources if CUDA is found
 if(CUDA_FOUND)
+    enable_language(CUDA)
     list(APPEND TENSOR_SOURCES src/core/cuda_utils.cpp)
+    list(APPEND TENSOR_SOURCES src/cuda/elementwise_cuda.cu)
 endif()
 
 # Create Tensor library
@@ -70,6 +72,7 @@ add_executable(optimizer_test src/tests/optimizer_test.cpp)
 add_executable(loss_test src/tests/loss_test.cpp)
 add_executable(mixed_precision_test src/tests/mixed_precision_test.cpp)
 add_executable(end_to_end_test src/tests/end_to_end_test.cpp)
+add_executable(cuda_test src/tests/cuda_test.cpp)
 
 # Link libraries
 if(CUDA_FOUND)
@@ -83,6 +86,7 @@ if(CUDA_FOUND)
     target_link_libraries(loss_test tensor_lib GTest::GTest GTest::Main ${CUDA_LIBRARIES})
     target_link_libraries(mixed_precision_test tensor_lib GTest::GTest GTest::Main ${CUDA_LIBRARIES})
     target_link_libraries(end_to_end_test tensor_lib GTest::GTest GTest::Main ${CUDA_LIBRARIES})
+    target_link_libraries(cuda_test tensor_lib GTest::GTest GTest::Main ${CUDA_LIBRARIES})
 else()
     target_link_libraries(tensor_test tensor_lib GTest::GTest GTest::Main)
     target_link_libraries(autograd_test tensor_lib GTest::GTest GTest::Main)
@@ -94,6 +98,7 @@ else()
     target_link_libraries(loss_test tensor_lib GTest::GTest GTest::Main)
     target_link_libraries(mixed_precision_test tensor_lib GTest::GTest GTest::Main)
     target_link_libraries(end_to_end_test tensor_lib GTest::GTest GTest::Main)
+    target_link_libraries(cuda_test tensor_lib GTest::GTest GTest::Main)
 endif()
 
 # Enable testing
@@ -109,3 +114,4 @@ add_test(NAME OptimizerTest COMMAND optimizer_test)
 add_test(NAME LossTest COMMAND loss_test)
 add_test(NAME MixedPrecisionTest COMMAND mixed_precision_test)
 add_test(NAME EndToEndTest COMMAND end_to_end_test)
+add_test(NAME CUDATest COMMAND cuda_test)

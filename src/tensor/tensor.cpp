@@ -1,5 +1,6 @@
 #include "tensor.h"
 #include "tensor_impl.h"
+#include "../core/allocators.h"
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -8,7 +9,34 @@
 #include <cmath>
 #include <optional>
 #include <stack>
+#include "../cuda/elementwise_cuda.h"
+#include "../core/cuda_utils.h"
 
+#ifdef USE_CUDA
+// Generic dispatcher for CUDA binary elementwise operations
+template<typename Op>
+void dispatch_cuda_binary_op(const Tensor& a, const Tensor& b, Tensor& result, Op op) {
+    switch (a.dtype()) {
+        case DType::Float32:
+            op(static_cast<const float*>(a.data()), static_cast<const float*>(b.data()), static_cast<float*>(result.data()), result.numel());
+            break;
+        case DType::Int32:
+            op(static_cast<const int32_t*>(a.data()), static_cast<const int32_t*>(b.data()), static_cast<int32_t*>(result.data()), result.numel());
+            break;
+        case DType::Int64:
+            op(static_cast<const int64_t*>(a.data()), static_cast<const int64_t*>(b.data()), static_cast<int64_t*>(result.data()), result.numel());
+            break;
+        case DType::Float16:
+            op(static_cast<const float16_t*>(a.data()), static_cast<const float16_t*>(b.data()), static_cast<float16_t*>(result.data()), result.numel());
+            break;
+        case DType::BFloat16:
+            op(static_cast<const bfloat16_t*>(a.data()), static_cast<const bfloat16_t*>(b.data()), static_cast<bfloat16_t*>(result.data()), result.numel());
+            break;
+        default:
+            throw std::runtime_error("Unsupported dtype for CUDA binary operation");
+    }
+}
+#endif
 
 size_t Tensor::numel() const {return impl_->numel();}
 
@@ -22,7 +50,7 @@ Tensor::Tensor(std::vector<int64_t> shape, DType dtype, Device deviceT){
     std::shared_ptr<Allocator> allocator;
     if (deviceT == Device::CUDA) {
 #ifdef USE_CUDA
-        allocator = std::make_shared<CUDAAllocatorPlaceHolder>();
+        allocator = std::make_shared<CUDAAllocator>();
 #else
         throw std::runtime_error("CUDA not supported in this build");
 #endif
@@ -161,6 +189,22 @@ Tensor Tensor::operator*(const Tensor& other) const{
     if (impl_->dtype() != other.impl_->dtype()) {
         throw std::runtime_error("Dtypes must match for elementwise multiplication");
     }
+    if (device() != other.device()) {
+        throw std::runtime_error("Device Mismatch");
+    }
+    if (device() == Device::CUDA) {
+#ifdef USE_CUDA
+        std::vector<int64_t> broadcasted_shape = broadcast_to_shape<float>(shape(), other.shape());
+        Tensor result(broadcasted_shape, dtype(), Device::CUDA);
+        dispatch_cuda_binary_op(*this, other, result, [](auto a, auto b, auto out, int64_t size) {
+            cuda_mul(a, b, out, size);
+        });
+        cuda_check_error(cudaGetLastError(), "CUDA mul failed");
+        return result;
+#else
+        throw std::runtime_error("CUDA not supported in this build");
+#endif
+    }
     std::optional<Tensor> result;
     switch (impl_->dtype()) {
         case DType::Float32:
@@ -186,6 +230,22 @@ Tensor Tensor::operator*(const Tensor& other) const{
 Tensor Tensor::operator+(const Tensor& other) const{
     if (impl_->dtype() != other.impl_->dtype()) {
         throw std::runtime_error("Dtypes must match for elementwise addition");
+    }
+    if (device() != other.device()) {
+        throw std::runtime_error("Device Mismatch");
+    }
+    if (device() == Device::CUDA) {
+#ifdef USE_CUDA
+        std::vector<int64_t> broadcasted_shape = broadcast_to_shape<float>(shape(), other.shape());
+        Tensor result(broadcasted_shape, dtype(), Device::CUDA);
+        dispatch_cuda_binary_op(*this, other, result, [](auto a, auto b, auto out, int64_t size) {
+            cuda_add(a, b, out, size);
+        });
+        cuda_check_error(cudaGetLastError(), "CUDA add failed");
+        return result;
+#else
+        throw std::runtime_error("CUDA not supported in this build");
+#endif
     }
     std::optional<Tensor> result;
     switch (impl_->dtype()) {
@@ -213,6 +273,22 @@ Tensor Tensor::operator-(const Tensor& other) const{
     if (impl_->dtype() != other.impl_->dtype()) {
         throw std::runtime_error("Dtypes must match for elementwise subtraction");
     }
+    if (device() != other.device()) {
+        throw std::runtime_error("Device Mismatch");
+    }
+    if (device() == Device::CUDA) {
+#ifdef USE_CUDA
+        std::vector<int64_t> broadcasted_shape = broadcast_to_shape<float>(shape(), other.shape());
+        Tensor result(broadcasted_shape, dtype(), Device::CUDA);
+        dispatch_cuda_binary_op(*this, other, result, [](auto a, auto b, auto out, int64_t size) {
+            cuda_sub(a, b, out, size);
+        });
+        cuda_check_error(cudaGetLastError(), "CUDA sub failed");
+        return result;
+#else
+        throw std::runtime_error("CUDA not supported in this build");
+#endif
+    }
     std::optional<Tensor> result;
     switch (impl_->dtype()) {
         case DType::Float32:
@@ -238,6 +314,22 @@ Tensor Tensor::operator-(const Tensor& other) const{
 Tensor Tensor::operator/(const Tensor& other) const{
     if (impl_->dtype() != other.impl_->dtype()) {
         throw std::runtime_error("Dtypes must match for elementwise division");
+    }
+    if (device() != other.device()) {
+        throw std::runtime_error("Device Mismatch");
+    }
+    if (device() == Device::CUDA) {
+#ifdef USE_CUDA
+        std::vector<int64_t> broadcasted_shape = broadcast_to_shape<float>(shape(), other.shape());
+        Tensor result(broadcasted_shape, dtype(), Device::CUDA);
+        dispatch_cuda_binary_op(*this, other, result, [](auto a, auto b, auto out, int64_t size) {
+            cuda_div(a, b, out, size);
+        });
+        cuda_check_error(cudaGetLastError(), "CUDA div failed");
+        return result;
+#else
+        throw std::runtime_error("CUDA not supported in this build");
+#endif
     }
     std::optional<Tensor> result;
     switch (impl_->dtype()) {
@@ -715,4 +807,31 @@ Tensor Tensor::softmax(int64_t dim) {
         default:
             throw std::runtime_error("Softmax only supports float types");
     }
+}
+
+
+Tensor Tensor::toDevice(Device targetDevice){
+    if (device() == targetDevice) {
+        return *this;
+    }
+
+    Tensor result(shape(), dtype(), targetDevice);
+
+    if (device() == Device::CPU && targetDevice == Device::CUDA) {
+#ifdef USE_CUDA
+        cuda_check_error(cudaMemcpy(result.data(), data(), numel() * dtype_size(dtype()), cudaMemcpyHostToDevice), "cudaMemcpy H2D failed");
+#else
+        throw std::runtime_error("CUDA not supported in this build");
+#endif
+    } else if (device() == Device::CUDA && targetDevice == Device::CPU) {
+#ifdef USE_CUDA
+        cuda_check_error(cudaMemcpy(result.data(), data(), numel() * dtype_size(dtype()), cudaMemcpyDeviceToHost), "cudaMemcpy D2H failed");
+#else
+        throw std::runtime_error("CUDA not supported in this build");
+#endif
+    } else {
+        throw std::runtime_error("Unsupported device transfer");
+    }
+
+    return result;
 }

@@ -8,6 +8,10 @@
 #include <stdexcept>
 #include "../core/grad_fn.h"
 
+// Forward declarations for low-precision types (defined in dtype_utils.h)
+struct float16_t;
+struct bfloat16_t;
+
 class Tensor {
     friend class TensorTest_BasicConstruction_Test;
     friend class TensorTest_CopySemantics_Test;
@@ -109,6 +113,8 @@ public:
     Tensor softmax(int64_t dim);
     Tensor softmax(int64_t dim);
 
+    Tensor toDevice(Device targetDevice);
+
     // Template implementations (must be in header)
     template<typename T>
     static std::vector<int64_t> broadcast_to_shape(const std::vector<int64_t>& shape,
@@ -184,10 +190,18 @@ public:
             if (impl_->dtype() != DType::Int64) {
                 throw std::runtime_error("Cannot access Int64 data from non-Int64 tensor");
             }
+        } else if constexpr (std::is_same_v<T, float16_t>) {
+            if (impl_->dtype() != DType::Float16) {
+                throw std::runtime_error("Cannot access Float16 data from non-Float16 tensor");
+            }
+        } else if constexpr (std::is_same_v<T, bfloat16_t>) {
+            if (impl_->dtype() != DType::BFloat16) {
+                throw std::runtime_error("Cannot access BFloat16 data from non-BFloat16 tensor");
+            }
         } else {
             static_assert(!std::is_same_v<T, T>, "Unsupported type for at()");
         }
-        
+
         auto* data = static_cast<T*>(impl_->storage()->data());
         return data[flatIndex + impl_->offset()];
     }
@@ -206,10 +220,18 @@ public:
             if (impl_->dtype() != DType::Int64) {
                 throw std::runtime_error("Cannot access Int64 data from non-Int64 tensor");
             }
+        } else if constexpr (std::is_same_v<T, float16_t>) {
+            if (impl_->dtype() != DType::Float16) {
+                throw std::runtime_error("Cannot access Float16 data from non-Float16 tensor");
+            }
+        } else if constexpr (std::is_same_v<T, bfloat16_t>) {
+            if (impl_->dtype() != DType::BFloat16) {
+                throw std::runtime_error("Cannot access BFloat16 data from non-BFloat16 tensor");
+            }
         } else {
             static_assert(!std::is_same_v<T, T>, "Unsupported type for at()");
         }
-        
+
         auto* data = static_cast<const T*>(impl_->storage()->data());
         return data[flatIndex + impl_->offset()];
     }
@@ -228,10 +250,18 @@ public:
             if (impl_->dtype() != DType::Int64) {
                 throw std::runtime_error("Cannot access Int64 data from non-Int64 tensor");
             }
+        } else if constexpr (std::is_same_v<T, float16_t>) {
+            if (impl_->dtype() != DType::Float16) {
+                throw std::runtime_error("Cannot access Float16 data from non-Float16 tensor");
+            }
+        } else if constexpr (std::is_same_v<T, bfloat16_t>) {
+            if (impl_->dtype() != DType::BFloat16) {
+                throw std::runtime_error("Cannot access BFloat16 data from non-BFloat16 tensor");
+            }
         } else {
             static_assert(!std::is_same_v<T, T>, "Unsupported type for at()");
         }
-        
+
         auto* data = static_cast<T*>(impl_->storage()->data());
         size_t flatIndex = 0;
         for(size_t i = 0; i < indices.size(); ++i) {
@@ -254,10 +284,18 @@ public:
             if (impl_->dtype() != DType::Int64) {
                 throw std::runtime_error("Cannot access Int64 data from non-Int64 tensor");
             }
+        } else if constexpr (std::is_same_v<T, float16_t>) {
+            if (impl_->dtype() != DType::Float16) {
+                throw std::runtime_error("Cannot access Float16 data from non-Float16 tensor");
+            }
+        } else if constexpr (std::is_same_v<T, bfloat16_t>) {
+            if (impl_->dtype() != DType::BFloat16) {
+                throw std::runtime_error("Cannot access BFloat16 data from non-BFloat16 tensor");
+            }
         } else {
             static_assert(!std::is_same_v<T, T>, "Unsupported type for at()");
         }
-        
+
         auto* data = static_cast<const T*>(impl_->storage()->data());
         size_t flatIndex = 0;
         for(size_t i = 0; i < indices.size(); ++i) {

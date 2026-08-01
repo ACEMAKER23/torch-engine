@@ -5,7 +5,7 @@
 #include "dtype.h"
 
 #ifdef USE_CUDA
-#include <cuda_runtime.h>
+#include "cuda_utils.h"
 #endif
 
 class Allocator{
@@ -32,19 +32,18 @@ class CPUAllocator : public Allocator{
 };
 
 #ifdef USE_CUDA
-class CUDAAllocatorPlaceHolder : public Allocator{
+class CUDAAllocator : public Allocator{
     //return a void pointer to any memory on gpu of size bytes
     void* allocate(size_t bytes) override {
         void* ptr;
-        cudaError_t err = cudaMalloc(&ptr, bytes);
-        if (err != cudaSuccess) {
-            return nullptr;
-        }
+        cuda_check_error(cudaMalloc(&ptr, bytes), "cudaMalloc failed");
         return ptr;
     }
 
     void deallocate(void* ptr) override {
-        cudaFree(ptr);
+        if (ptr != nullptr) {
+            cuda_check_error(cudaFree(ptr), "cudaFree failed");
+        }
     }
 
     Device device() const override {
