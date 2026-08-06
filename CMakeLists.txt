@@ -54,6 +54,7 @@ set(TENSOR_SOURCES
 # Add CUDA sources if CUDA is found
 if(CUDA_FOUND)
     enable_language(CUDA)
+    set(CMAKE_CUDA_ARCHITECTURES 80)
     list(APPEND TENSOR_SOURCES src/core/cuda_utils.cpp)
     list(APPEND TENSOR_SOURCES src/cuda/elementwise_cuda.cu)
 endif()
@@ -74,6 +75,14 @@ add_executable(mixed_precision_test src/tests/mixed_precision_test.cpp)
 add_executable(end_to_end_test src/tests/end_to_end_test.cpp)
 add_executable(cuda_test src/tests/cuda_test.cpp)
 
+if(CUDA_FOUND)
+    add_executable(matmul_benchmark src/benchmarks/matmul_benchmark.cpp)
+    target_link_libraries(matmul_benchmark tensor_lib ${CUDA_LIBRARIES} ${CUDA_cublas_LIBRARY})
+
+    add_executable(matmul_profile src/benchmarks/matmul_profile.cpp)
+    target_link_libraries(matmul_profile tensor_lib ${CUDA_LIBRARIES} ${CUDA_cublas_LIBRARY})
+endif()
+
 # Link libraries
 if(CUDA_FOUND)
     target_link_libraries(tensor_test tensor_lib GTest::GTest GTest::Main ${CUDA_LIBRARIES})
@@ -86,7 +95,7 @@ if(CUDA_FOUND)
     target_link_libraries(loss_test tensor_lib GTest::GTest GTest::Main ${CUDA_LIBRARIES})
     target_link_libraries(mixed_precision_test tensor_lib GTest::GTest GTest::Main ${CUDA_LIBRARIES})
     target_link_libraries(end_to_end_test tensor_lib GTest::GTest GTest::Main ${CUDA_LIBRARIES})
-    target_link_libraries(cuda_test tensor_lib GTest::GTest GTest::Main ${CUDA_LIBRARIES})
+    target_link_libraries(cuda_test tensor_lib GTest::GTest GTest::Main ${CUDA_LIBRARIES} ${CUDA_cublas_LIBRARY})
 else()
     target_link_libraries(tensor_test tensor_lib GTest::GTest GTest::Main)
     target_link_libraries(autograd_test tensor_lib GTest::GTest GTest::Main)

@@ -1,5 +1,6 @@
+#ifdef __clang__
 #include <__clang_cuda_builtin_vars.h>
-#include <__clang_cuda_runtime_wrapper.h>
+#endif
 #include <cuda_runtime.h>
 #include <cstdint>
 #include "../core/dtype_utils.h"
@@ -191,9 +192,10 @@ __global__ void matmul_kernel_vectorized_input (const T* __restrict__ A, const T
         THREAD_TILE % vectorSize == 0
     );
     constexpr int loopNum = THREAD_TILE / vectorSize; //how many times each thread iterate loading a uint4Size every time.
+    constexpr int SMEM_PAD_A = 0; // keep A rows 16-byte aligned for uint4
     int tid = threadIdx.y * blockDim.x + threadIdx.x;
 
-    __shared__ T tileA[BLOCK_M][BK+1];
+    __shared__ T tileA[BLOCK_M][BK + SMEM_PAD_A];
     __shared__ T tileB[BK][BLOCK_N];
 
     T accum[THREAD_TILE][THREAD_TILE] = {};
@@ -240,7 +242,7 @@ __global__ void matmul_kernel_vectorized_input (const T* __restrict__ A, const T
 
             if (globalCol + vectorSize <= N && globalRow < K){
                 *reinterpret_cast<uint4*>(&tileB[sharedRow][sharedCol]) =
-                            *reinterpret_cast<const uint4*>(&B[globalRow * K + globalCol]);      
+                            *reinterpret_cast<const uint4*>(&B[globalRow * N + globalCol]);      
             }
             else{
                 for(int j=0; j<vectorSize; ++j){
@@ -323,7 +325,7 @@ __global__ void matmul_kernel_warp_tiling(
 
     constexpr int UINT4_BYTES = 16;
     constexpr int VECTOR_SIZE = UINT4_BYTES / sizeof(T);
-
+    constexpr int SMEM_PAD_A = 0; // keep A rows 16-byte aligned for uint4
 
     static_assert(
         THREAD_TILE_N % VECTOR_SIZE == 0
@@ -371,7 +373,7 @@ __global__ void matmul_kernel_warp_tiling(
 
 
 
-    __shared__ T tileA[BLOCK_M][BK+1];
+    __shared__ T tileA[BLOCK_M][BK + SMEM_PAD_A];
     __shared__ T tileB[BK][BLOCK_N];
 
 
@@ -587,28 +589,7 @@ __global__ void matmul_kernel_warp_tiling(
         threadRow;
 
 
-    int colStart =
-        blockIdx.x*BLOCK_N
-        +// ========== CP.ASYNC PTX PRIMITIVES ==========
-__device__ __forceinline__ void cp_async_16(void* smem_ptr, const void* global_ptr, bool valid, int remaining_bytes) {
-    unsigned int smem_addr = __cvta_generic_to_shared(smem_ptr);
-    int src_size = valid ? max(0, min(16, remaining_bytes)) : 0;
-    asm volatile(
-        "cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
-        :: "r"(smem_addr), "l"(global_ptr), "r"(src_size)
-    );
-}
-
-__device__ __forceinline__ void cp_async_commit() {
-    asm volatile("cp.async.commit_group;\n");
-}
-
-template<int N>
-__device__ __forceinline__ void cp_async_wait() {
-    asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
-}
-// ============================================s
-        threadCol;
+    int colStart = blockIdx.x * BLOCK_N + threadCol;
 
 
 
@@ -661,6 +642,7 @@ __global__ void matmul_kernel_double_buffered(
     
     constexpr int UINT4_BYTES = 16;
     constexpr int VECTOR_SIZE = UINT4_BYTES / sizeof(T);
+    constexpr int SMEM_PAD_A = 0; // keep A rows 16-byte aligned for uint4
     
     int tid = threadIdx.x;
     int warpId = tid / 32;
@@ -676,7 +658,7 @@ __global__ void matmul_kernel_double_buffered(
     int threadCol = warpCol * WARP_TILE_N + laneInGroup * THREAD_TILE_N;
     
     // ========== DOUBLE BUFFERING: TWO SHARED MEMORY BUFFERS ==========
-    __shared__ T tileA[2][BLOCK_M][BK+1];
+    __shared__ T tileA[2][BLOCK_M][BK + SMEM_PAD_A];
     __shared__ T tileB[2][BK][BLOCK_N];
     // ===================================================================
     
@@ -1023,11 +1005,14 @@ __global__ void matmul_kernel_double_buffered_cpasync(
 // ========== SWIZZLE HELPER FUNCTION ==========
 // Maps 16-byte vector chunks into swizzled physical bank locations.
 // Eliminates 4-way bank conflicts across thread groups while preserving 16-byte alignment.
+template<typename T>
 __device__ __forceinline__ int swizzle_col_A(int row, int col) {
-    int vec_col = col / 4;        // 16-byte vector chunk index (0, 1, 2, 3)
-    int off_col = col % 4;        // Element index within the 16-byte vector (0..3)
-    int swizzle_pattern = vec_col ^ (row / 8) % 4;
-    return swizzle_pattern * 4 + off_col;
+    constexpr int ELEMS_PER_16B = 16 / sizeof(T);
+    int vec_col = col / ELEMS_PER_16B;        // 16-byte vector chunk index
+    int off_col = col % ELEMS_PER_16B;        // Element index within the 16-byte vector
+    int num_vec = 16 / ELEMS_PER_16B;         // number of 16-byte chunks in BK=16
+    int swizzle_pattern = vec_col ^ ((row / 8) % num_vec);
+    return swizzle_pattern * ELEMS_PER_16B + off_col;
 }
 // ============================================
 
@@ -1094,7 +1079,7 @@ __global__ void matmul_kernel_double_buffered_swizzled(
             int remaining_bytes = (K - globalCol) * static_cast<int>(sizeof(T));
             
             // SWIZZLED STORE: Write into swizzled shared memory address
-            int swizzled_col = swizzle_col_A(row, col);
+            int swizzled_col = swizzle_col_A<T>(row, col);
             
             cp_async_16(
                 &tileA[buf_idx][row][swizzled_col],
@@ -1154,7 +1139,7 @@ __global__ void matmul_kernel_double_buffered_swizzled(
             #pragma unroll
             for(int i = 0; i < THREAD_TILE_M; i++) {
                 // SWIZZLED READ: Match the swizzled layout used during load
-                int swizzled_k = swizzle_col_A(threadRow + i, k);
+                int swizzled_k = swizzle_col_A<T>(threadRow + i, k);
                 A_reg[i] = tileA[bufferIdx][threadRow + i][swizzled_k];
             }
             
@@ -1260,7 +1245,7 @@ __global__ void matmul_kernel_vector_storage (
             int remaining_bytes = (K - globalCol) * static_cast<int>(sizeof(T));
             
             // SWIZZLED STORE: Write into swizzled shared memory address
-            int swizzled_col = swizzle_col_A(row, col);
+            int swizzled_col = swizzle_col_A<T>(row, col);
             
             cp_async_16(
                 &tileA[buf_idx][row][swizzled_col],
@@ -1320,7 +1305,7 @@ __global__ void matmul_kernel_vector_storage (
             #pragma unroll
             for(int i = 0; i < THREAD_TILE_M; i++) {
                 // SWIZZLED READ: Match the swizzled layout used during load
-                int swizzled_k = swizzle_col_A(threadRow + i, k);
+                int swizzled_k = swizzle_col_A<T>(threadRow + i, k);
                 A_reg[i] = tileA[bufferIdx][threadRow + i][swizzled_k];
             }
             
@@ -1424,6 +1409,7 @@ __global__ void matmul_kernel_3stage_cpasync(
     
     constexpr int UINT4_BYTES = 16;
     constexpr int VECTOR_SIZE = UINT4_BYTES / sizeof(T);
+    constexpr int SMEM_PAD_A = VECTOR_SIZE; 
 
     int tid = threadIdx.x;
     int warpId = tid / 32;
@@ -1459,7 +1445,7 @@ __global__ void matmul_kernel_3stage_cpasync(
             
             bool valid = (globalRow < M) && (globalCol < K);
             int remaining_bytes = (K - globalCol) * static_cast<int>(sizeof(T));
-            int swizzled_col = swizzle_col_A(row, col);
+            int swizzled_col = swizzle_col_A<T>(row, col);
             
             cp_async_16(
                 &tileA[stage_idx][row][swizzled_col],
@@ -1530,7 +1516,7 @@ __global__ void matmul_kernel_3stage_cpasync(
         {
             #pragma unroll
             for (int i = 0; i < THREAD_TILE_M; i++) {
-                int swizzled_k = swizzle_col_A(threadRow + i, k);
+                int swizzled_k = swizzle_col_A<T>(threadRow + i, k);
                 A_reg[i] = tileA[read_stage][threadRow + i][swizzled_k];
             }
             
@@ -1958,8 +1944,8 @@ __global__ void matmul_kernel_ampere(
         uint32_t a_frag[WARP_MMA_M][4];
 #pragma unroll
         for (int i = 0; i < WARP_MMA_M; i++) {
-            int a_row = (laneId % 8) + ((laneId >> 4) * 8) + i * MMA_M;
-            int a_col = ((laneId >> 3) & 1) * 8;
+            int a_row = (laneId % 16) + i * MMA_M;
+            int a_col = (laneId / 16) * 8;
             uint32_t smem_ptr = __cvta_generic_to_shared(&warpA[a_row * BK + a_col]);
             asm volatile(
                 "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
@@ -2157,37 +2143,129 @@ void cuda_matmul(const float* A, const float* B, float* C, int M, int K, int N) 
     matmul_kernel<float><<<blocks, threads>>>(A, B, C, M, K, N);
 }
 
-void cuda_matmul_register(const float* A, const float* B, float* C, int M, int K, int N) {
-    int compT = 8;
-    dim3 threads(16, 16);
-    dim3 blocks((N + threads.x*compT - 1) / (threads.x*compT), (M + threads.y*compT - 1) / (threads.y*compT));
-    matmul_kernel<float><<<blocks, threads>>>(A, B, C, M, K, N);
+void cuda_matmul_shared_memory(const float* A, const float* B, float* C, int M, int K, int N) {
+    constexpr int TILE = 16;
+    dim3 threads(TILE, TILE);
+    dim3 blocks((N + TILE - 1) / TILE, (M + TILE - 1) / TILE);
+    matmul_kernel_shared_memory<float><<<blocks, threads>>>(A, B, C, M, K, N);
 }
 
+void cuda_matmul_register_blocking(const float* A, const float* B, float* C, int M, int K, int N) {
+    constexpr int BLOCK_M = 128;
+    constexpr int BLOCK_N = 128;
+    dim3 threads(16, 16);
+    dim3 blocks((N + BLOCK_N - 1) / BLOCK_N, (M + BLOCK_M - 1) / BLOCK_M);
+    matmul_kernel_register_blcoking<float><<<blocks, threads>>>(A, B, C, M, K, N);
+}
 
-void launch_matmul(float* A, float* B, float* C, int M, int K, int N){
-    dim3 block(
-        256,
-        1,
-        1
-    );
+void cuda_matmul_vectorized_input(const float* A, const float* B, float* C, int M, int K, int N) {
+    constexpr int BLOCK_M = 128;
+    constexpr int BLOCK_N = 128;
+    dim3 threads(16, 16);
+    dim3 blocks((N + BLOCK_N - 1) / BLOCK_N, (M + BLOCK_M - 1) / BLOCK_M);
+    matmul_kernel_vectorized_input<float><<<blocks, threads>>>(A, B, C, M, K, N);
+}
 
-    dim3 grid(
-        (N + 128 - 1) / 128,
-        (M + 128 - 1) / 128
-    );
+void cuda_matmul_warp_tiling(const float* A, const float* B, float* C, int M, int K, int N) {
+    dim3 block(256, 1, 1);
+    dim3 grid((N + 128 - 1) / 128, (M + 128 - 1) / 128);
+    matmul_kernel_warp_tiling<float><<<grid, block>>>(A, B, C, M, K, N);
+}
 
-    matmul_kernel_warp_tiling<float>
-        <<<grid, block>>>(
-            A,
-            B,
-            C,
-            M,
-            K,
-            N
-        );
+void cuda_matmul_double_buffered(const float* A, const float* B, float* C, int M, int K, int N) {
+    dim3 block(256, 1, 1);
+    dim3 grid((N + 128 - 1) / 128, (M + 128 - 1) / 128);
+    matmul_kernel_double_buffered<float><<<grid, block>>>(A, B, C, M, K, N);
+}
 
-    cudaDeviceSynchronize();
+void cuda_matmul_double_buffered_cpasync(const float* A, const float* B, float* C, int M, int K, int N) {
+    dim3 block(256, 1, 1);
+    dim3 grid((N + 128 - 1) / 128, (M + 128 - 1) / 128);
+    matmul_kernel_double_buffered_cpasync<float><<<grid, block>>>(A, B, C, M, K, N);
+}
+
+void cuda_matmul_double_buffered_swizzled(const float* A, const float* B, float* C, int M, int K, int N) {
+    dim3 block(256, 1, 1);
+    dim3 grid((N + 128 - 1) / 128, (M + 128 - 1) / 128);
+    matmul_kernel_double_buffered_swizzled<float><<<grid, block>>>(A, B, C, M, K, N);
+}
+
+void cuda_matmul_vector_storage(const float* A, const float* B, float* C, int M, int K, int N) {
+    dim3 block(256, 1, 1);
+    dim3 grid((N + 128 - 1) / 128, (M + 128 - 1) / 128);
+    matmul_kernel_vector_storage<float><<<grid, block>>>(A, B, C, M, K, N);
+}
+
+void cuda_matmul_3stage_cpasync(const float* A, const float* B, float* C, int M, int K, int N) {
+    dim3 block(256, 1, 1);
+    dim3 grid((N + 128 - 1) / 128, (M + 128 - 1) / 128);
+    matmul_kernel_3stage_cpasync<float><<<grid, block>>>(A, B, C, M, K, N);
+}
+
+// FP16 non-tensor-core matmul launchers
+void cuda_matmul(const half* A, const half* B, half* C, int M, int K, int N) {
+    dim3 threads(16, 16);
+    dim3 blocks((N + threads.x - 1) / threads.x, (M + threads.y - 1) / threads.y);
+    matmul_kernel<half><<<blocks, threads>>>(A, B, C, M, K, N);
+}
+
+void cuda_matmul_shared_memory(const half* A, const half* B, half* C, int M, int K, int N) {
+    constexpr int TILE = 16;
+    dim3 threads(TILE, TILE);
+    dim3 blocks((N + TILE - 1) / TILE, (M + TILE - 1) / TILE);
+    matmul_kernel_shared_memory<half><<<blocks, threads>>>(A, B, C, M, K, N);
+}
+
+void cuda_matmul_register_blocking(const half* A, const half* B, half* C, int M, int K, int N) {
+    constexpr int BLOCK_M = 128;
+    constexpr int BLOCK_N = 128;
+    dim3 threads(16, 16);
+    dim3 blocks((N + BLOCK_N - 1) / BLOCK_N, (M + BLOCK_M - 1) / BLOCK_M);
+    matmul_kernel_register_blcoking<half><<<blocks, threads>>>(A, B, C, M, K, N);
+}
+
+void cuda_matmul_vectorized_input(const half* A, const half* B, half* C, int M, int K, int N) {
+    constexpr int BLOCK_M = 128;
+    constexpr int BLOCK_N = 128;
+    dim3 threads(16, 16);
+    dim3 blocks((N + BLOCK_N - 1) / BLOCK_N, (M + BLOCK_M - 1) / BLOCK_M);
+    matmul_kernel_vectorized_input<half><<<blocks, threads>>>(A, B, C, M, K, N);
+}
+
+void cuda_matmul_warp_tiling(const half* A, const half* B, half* C, int M, int K, int N) {
+    dim3 block(256, 1, 1);
+    dim3 grid((N + 128 - 1) / 128, (M + 128 - 1) / 128);
+    matmul_kernel_warp_tiling<half><<<grid, block>>>(A, B, C, M, K, N);
+}
+
+void cuda_matmul_double_buffered(const half* A, const half* B, half* C, int M, int K, int N) {
+    dim3 block(256, 1, 1);
+    dim3 grid((N + 128 - 1) / 128, (M + 128 - 1) / 128);
+    matmul_kernel_double_buffered<half><<<grid, block>>>(A, B, C, M, K, N);
+}
+
+void cuda_matmul_double_buffered_cpasync(const half* A, const half* B, half* C, int M, int K, int N) {
+    dim3 block(256, 1, 1);
+    dim3 grid((N + 128 - 1) / 128, (M + 128 - 1) / 128);
+    matmul_kernel_double_buffered_cpasync<half><<<grid, block>>>(A, B, C, M, K, N);
+}
+
+void cuda_matmul_double_buffered_swizzled(const half* A, const half* B, half* C, int M, int K, int N) {
+    dim3 block(256, 1, 1);
+    dim3 grid((N + 128 - 1) / 128, (M + 128 - 1) / 128);
+    matmul_kernel_double_buffered_swizzled<half><<<grid, block>>>(A, B, C, M, K, N);
+}
+
+void cuda_matmul_vector_storage(const half* A, const half* B, half* C, int M, int K, int N) {
+    dim3 block(256, 1, 1);
+    dim3 grid((N + 128 - 1) / 128, (M + 128 - 1) / 128);
+    matmul_kernel_vector_storage<half><<<grid, block>>>(A, B, C, M, K, N);
+}
+
+void cuda_matmul_3stage_cpasync(const half* A, const half* B, half* C, int M, int K, int N) {
+    dim3 block(256, 1, 1);
+    dim3 grid((N + 128 - 1) / 128, (M + 128 - 1) / 128);
+    matmul_kernel_3stage_cpasync<half><<<grid, block>>>(A, B, C, M, K, N);
 }
 
 void launch_matmul_tensor_core(

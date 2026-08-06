@@ -63,7 +63,7 @@ struct float16_t {
     // Convert from float16 to float32
     HD float to_float32() const {
         uint32_t sign = (bits >> 15) & 0x1;
-        uint32_t exponent = (bits >> 10) & 0x1F;
+        int32_t exponent = (bits >> 10) & 0x1F;
         uint32_t mantissa = bits & 0x3FF;
 
         uint32_t f_bits;
@@ -78,7 +78,7 @@ struct float16_t {
                 }
                 exponent++;
                 mantissa &= 0x3FF;
-                f_bits |= ((exponent + 127) << 23) | (mantissa << 13);
+                f_bits |= (static_cast<uint32_t>(exponent + 112) << 23) | (mantissa << 13);
             }
         } else if (exponent == 31) {
             f_bits = (sign << 31) | 0x7F800000 | (mantissa << 13);
