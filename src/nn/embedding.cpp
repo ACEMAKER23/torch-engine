@@ -1,6 +1,12 @@
 #include "embedding.h"
+#include "../core/grad_fn.h"
 #include <random>
 #include <cmath>
+
+#ifdef USE_CUDA
+#include "../cuda/elementwise_cuda.h"
+#include "../core/cuda_utils.h"
+#endif
 
 Embedding::Embedding(int64_t num_embeddings, int64_t embedding_dim, DType dtype)
     : num_embeddings_(num_embeddings), embedding_dim_(embedding_dim),
@@ -18,26 +24,55 @@ Tensor Embedding::forward(const Tensor& input) {
     std::vector<int64_t> output_shape = input_shape;
     output_shape.push_back(embedding_dim_);
     
-    Tensor result(output_shape, weight_.dtype(), weight_.device());
+    if (input.dtype() != DType::Int64) {
+        throw std::runtime_error("Embedding input must be Int64");
+    }
     
-    // For each index in input, copy the corresponding embedding row
+    Tensor result(output_shape, weight_.dtype(), input.device());
     size_t total_indices = input.numel();
-    for (size_t i = 0; i < total_indices; ++i) {
-        int64_t idx = input.at<int64_t>(i);
-        if (idx < 0 || idx >= num_embeddings_) {
-            throw std::runtime_error("Embedding index out of range");
+    
+#ifdef USE_CUDA
+    if (input.device() == Device::CUDA) {
+        if (weight_.dtype() != DType::Float32) {
+            throw std::runtime_error("CUDA Embedding only supports Float32 weight");
         }
-        
-        // Copy embedding row to result
-        for (int64_t j = 0; j < embedding_dim_; ++j) {
-            if (weight_.dtype() == DType::Float32) {
-                result.at<float>(i * embedding_dim_ + j) = weight_.at<float>({idx, j});
-            } else if (weight_.dtype() == DType::Int32) {
-                result.at<int32_t>(i * embedding_dim_ + j) = weight_.at<int32_t>({idx, j});
-            } else if (weight_.dtype() == DType::Int64) {
-                result.at<int64_t>(i * embedding_dim_ + j) = weight_.at<int64_t>({idx, j});
+        Tensor weight_dev = weight_.toDevice(Device::CUDA);
+        cuda_check_error(cudaGetLastError(), "before embedding forward");
+        cuda_embedding_forward(static_cast<const int64_t*>(input.data()),
+                               static_cast<const float*>(weight_dev.data()),
+                               static_cast<float*>(result.data()),
+                               static_cast<int>(total_indices),
+                               static_cast<int>(embedding_dim_));
+        cuda_check_error(cudaGetLastError(), "cuda_embedding_forward failed");
+        cuda_check_error(cudaDeviceSynchronize(), "cudaDeviceSynchronize after embedding forward");
+    } else
+#endif
+    {
+        for (size_t i = 0; i < total_indices; ++i) {
+            int64_t idx = input.at<int64_t>(i);
+            if (idx < 0 || idx >= num_embeddings_) {
+                throw std::runtime_error("Embedding index out of range");
+            }
+            
+            for (int64_t j = 0; j < embedding_dim_; ++j) {
+                if (weight_.dtype() == DType::Float32) {
+                    result.at<float>(i * embedding_dim_ + j) = weight_.at<float>({idx, j});
+                } else if (weight_.dtype() == DType::Int32) {
+                    result.at<int32_t>(i * embedding_dim_ + j) = weight_.at<int32_t>({idx, j});
+                } else if (weight_.dtype() == DType::Int64) {
+                    result.at<int64_t>(i * embedding_dim_ + j) = weight_.at<int64_t>({idx, j});
+                }
             }
         }
+    }
+    
+    if (result.requiredGrad() || weight_.requiredGrad()) {
+        auto fn = std::make_shared<EmbeddingBackward>();
+        fn->inputs = {input, weight_};
+        fn->num_embeddings = num_embeddings_;
+        fn->embedding_dim   = embedding_dim_;
+        result.setGradFn(fn);
+        result.setRequiresGrad(true);
     }
     
     return result;

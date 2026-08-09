@@ -3,6 +3,11 @@
 #include <vector>
 #include <cmath>
 
+#ifdef USE_CUDA
+#include "../cuda/elementwise_cuda.h"
+#include "../core/cuda_utils.h"
+#endif
+
 // Helper: reduce gradient by summing over broadcast dimensions
 // If input_shape differs from grad_shape, sum over dimensions where input had size 1
 static Tensor reduce_gradient(const Tensor& grad, const std::vector<int64_t>& input_shape) {
@@ -159,22 +164,38 @@ std::vector<Tensor> ReluBackward::backward(const Tensor& pathDownGrad) {
 }
 
 std::vector<Tensor> GeluBackward::backward(const Tensor& pathDownGrad) {
-    // GELU gradient: 0.5 * (1 + tanh(z)) * (1 + x * (1 - tanh(z)^2) * (sqrt(2/pi) + 0.044715 * 3 * x^2))
-    // where z = sqrt(2/pi) * (x + 0.044715 * x^3)
-    // Use template helper to avoid cloning and use compile-time dispatch
-    const float sqrt_2_over_pi = 0.7978845608f;
-    const float coeff = 0.044715f;
+    const Tensor& input = inputs[0];
+    Tensor grad(input.shape(), input.dtype(), input.device());
 
-    auto grad = unary_backward(inputs[0], pathDownGrad,
-        [sqrt_2_over_pi, coeff](float input_val, float upstream_val) -> float {
-            float x_cubed = input_val * input_val * input_val;
-            float z = sqrt_2_over_pi * (input_val + coeff * x_cubed);
-            float tanh_z = std::tanh(z);
-            float sech_sq = 1.0f - tanh_z * tanh_z;
-            float inner = sqrt_2_over_pi * (1.0f + 3.0f * coeff * input_val * input_val);
-            float gelu_grad = 0.5f * (1.0f + tanh_z) * (1.0f + input_val * sech_sq * inner);
-            return upstream_val * gelu_grad;
-        });
+    if (input.device() == Device::CUDA && input.dtype() == DType::Float32) {
+#ifdef USE_CUDA
+        Tensor input_c = input.contiguous();
+        Tensor path_c  = pathDownGrad.contiguous();
+        cuda_gelu_backward(static_cast<const float*>(input_c.data()),
+                           static_cast<const float*>(path_c.data()),
+                           static_cast<float*>(grad.data()),
+                           static_cast<int64_t>(input.numel()));
+        cuda_check_error(cudaGetLastError(), "cuda_gelu_backward failed");
+        cuda_check_error(cudaDeviceSynchronize(), "cudaDeviceSynchronize after gelu backward");
+#else
+        throw std::runtime_error("CUDA not available");
+#endif
+    } else {
+        const float sqrt_2_over_pi = 0.7978845608f;
+        const float coeff = 0.044715f;
+
+        grad = unary_backward(input, pathDownGrad,
+            [sqrt_2_over_pi, coeff](float input_val, float upstream_val) -> float {
+                float x_cubed = input_val * input_val * input_val;
+                float z = sqrt_2_over_pi * (input_val + coeff * x_cubed);
+                float tanh_z = std::tanh(z);
+                float sech_sq = 1.0f - tanh_z * tanh_z;
+                float inner = sqrt_2_over_pi * (1.0f + 3.0f * coeff * input_val * input_val);
+                float gelu_grad = 0.5f * (1.0f + tanh_z) * (1.0f + input_val * sech_sq * inner);
+                return upstream_val * gelu_grad;
+            });
+    }
+
     grad.setRequiresGrad(false);
     return {grad};
 }
@@ -254,38 +275,68 @@ std::vector<Tensor> CrossEntropyBatchedBackward::backward(const Tensor& pathDown
     int64_t V = logShape[2];
     int64_t N = B * T;
 
-    float upstream = (pathDownGrad.numel() == 1) ? pathDownGrad.at<float>(0) : 1.0f;
+    float upstream = 1.0f;
+    if (pathDownGrad.numel() == 1) {
+        if (pathDownGrad.device() == Device::CUDA) {
+#ifdef USE_CUDA
+            cuda_check_error(
+                cudaMemcpy(&upstream, pathDownGrad.data(), sizeof(float), cudaMemcpyDeviceToHost),
+                "cudaMemcpy upstream D2H");
+#else
+            throw std::runtime_error("CUDA not available");
+#endif
+        } else {
+            upstream = pathDownGrad.at<float>(0);
+        }
+    }
     float scale = upstream / static_cast<float>(N);
 
-    const float* logits_ptr = static_cast<const float*>(logits.data());
-    const int64_t* targets_ptr = static_cast<const int64_t*>(targets.data());
-    const std::vector<int64_t>& ls = logits.strides();
-    const std::vector<int64_t>& ts = targets.strides();
-
     Tensor grad(logits.shape(), logits.dtype(), logits.device());
-    float* grad_ptr = static_cast<float*>(grad.data());
-    const std::vector<int64_t>& gs = grad.strides();
 
-    for (int64_t b = 0; b < B; ++b) {
-        for (int64_t t = 0; t < T; ++t) {
-            const float* row = logits_ptr + b * ls[0] + t * ls[1];
-            float* grad_row = grad_ptr + b * gs[0] + t * gs[1];
-            int64_t target_class = targets_ptr[b * ts[0] + t * ts[1]];
+    if (logits.device() == Device::CUDA) {
+#ifdef USE_CUDA
+        Tensor logits_c  = logits.contiguous();
+        Tensor targets_c = targets.contiguous();
+        cuda_crossentropy_batched_backward(
+            static_cast<const float*>(logits_c.data()),
+            static_cast<const int64_t*>(targets_c.data()),
+            static_cast<float*>(grad.data()),
+            scale,
+            static_cast<int>(B), static_cast<int>(T), static_cast<int>(V));
+        cuda_check_error(cudaGetLastError(), "cuda_crossentropy_batched_backward failed");
+        cuda_check_error(cudaDeviceSynchronize(), "cudaDeviceSynchronize after crossentropy backward");
+#else
+        throw std::runtime_error("CUDA not available");
+#endif
+    } else {
+        const float* logits_ptr = static_cast<const float*>(logits.data());
+        const int64_t* targets_ptr = static_cast<const int64_t*>(targets.data());
+        const std::vector<int64_t>& ls = logits.strides();
+        const std::vector<int64_t>& ts = targets.strides();
+        float* grad_ptr = static_cast<float*>(grad.data());
+        const std::vector<int64_t>& gs = grad.strides();
 
-            float max_logit = row[0];
-            for (int64_t v = 1; v < V; ++v) {
-                max_logit = std::max(max_logit, row[v * ls[2]]);
-            }
+        for (int64_t b = 0; b < B; ++b) {
+            for (int64_t t = 0; t < T; ++t) {
+                const float* row = logits_ptr + b * ls[0] + t * ls[1];
+                float* grad_row = grad_ptr + b * gs[0] + t * gs[1];
+                int64_t target_class = targets_ptr[b * ts[0] + t * ts[1]];
 
-            float sum_exp = 0.0f;
-            for (int64_t v = 0; v < V; ++v) {
-                sum_exp += std::exp(row[v * ls[2]] - max_logit);
-            }
+                float max_logit = row[0];
+                for (int64_t v = 1; v < V; ++v) {
+                    max_logit = std::max(max_logit, row[v * ls[2]]);
+                }
 
-            for (int64_t v = 0; v < V; ++v) {
-                float softmax_val = std::exp(row[v * ls[2]] - max_logit) / sum_exp;
-                float one_hot = (v == target_class) ? 1.0f : 0.0f;
-                grad_row[v * gs[2]] = (softmax_val - one_hot) * scale;
+                float sum_exp = 0.0f;
+                for (int64_t v = 0; v < V; ++v) {
+                    sum_exp += std::exp(row[v * ls[2]] - max_logit);
+                }
+
+                for (int64_t v = 0; v < V; ++v) {
+                    float softmax_val = std::exp(row[v * ls[2]] - max_logit) / sum_exp;
+                    float one_hot = (v == target_class) ? 1.0f : 0.0f;
+                    grad_row[v * gs[2]] = (softmax_val - one_hot) * scale;
+                }
             }
         }
     }
@@ -359,6 +410,51 @@ std::vector<Tensor> LayerNormBackward::backward(const Tensor& pathDownGrad) {
     const int64_t D     = x_shape.back();
     const int64_t batch = static_cast<int64_t>(x.numel()) / D;
     const float   N     = static_cast<float>(D);
+
+#ifdef USE_CUDA
+    if (x.device() == Device::CUDA) {
+        if (!x.is_contiguous() || !pathDownGrad.is_contiguous()) {
+            throw std::runtime_error("CUDA LayerNormBackward requires contiguous x and pathDownGrad");
+        }
+
+        Tensor gamma_dev = gamma.toDevice(Device::CUDA);
+
+        Tensor d_x(x_shape, x.dtype(), Device::CUDA);
+        Tensor d_gamma_gpu({D}, gamma.dtype(), Device::CUDA);
+        Tensor d_beta_gpu ({D}, gamma.dtype(), Device::CUDA);
+
+        cuda_fill(static_cast<float*>(d_gamma_gpu.data()), 0.0f, D);
+        cuda_fill(static_cast<float*>(d_beta_gpu.data()),  0.0f, D);
+
+        cuda_layernorm_backward(static_cast<const float*>(x.data()),
+                                static_cast<const float*>(gamma_dev.data()),
+                                static_cast<const float*>(pathDownGrad.data()),
+                                static_cast<float*>(d_x.data()),
+                                static_cast<float*>(d_gamma_gpu.data()),
+                                static_cast<float*>(d_beta_gpu.data()),
+                                static_cast<int>(batch),
+                                static_cast<int>(D),
+                                eps);
+        cuda_check_error(cudaGetLastError(), "cuda_layernorm_backward failed");
+        cuda_check_error(cudaDeviceSynchronize(), "cudaDeviceSynchronize after layernorm backward");
+
+        Tensor d_gamma({D}, gamma.dtype(), Device::CPU);
+        Tensor d_beta ({D}, gamma.dtype(), Device::CPU);
+        cuda_check_error(
+            cudaMemcpy(d_gamma.data(), d_gamma_gpu.data(), D * sizeof(float), cudaMemcpyDeviceToHost),
+            "cudaMemcpy d_gamma D2H");
+        cuda_check_error(
+            cudaMemcpy(d_beta.data(), d_beta_gpu.data(), D * sizeof(float), cudaMemcpyDeviceToHost),
+            "cudaMemcpy d_beta D2H");
+
+
+
+        d_x    .setRequiresGrad(false);
+        d_gamma.setRequiresGrad(false);
+        d_beta .setRequiresGrad(false);
+        return {d_x, d_gamma, d_beta};
+    }
+#endif
 
     Tensor d_x    (x_shape,      x.dtype(),     x.device());
     Tensor d_gamma({D},          gamma.dtype(), gamma.device());
@@ -461,6 +557,30 @@ std::vector<Tensor> SoftmaxBackward::backward(const Tensor& pathDownGrad) {
     Tensor dx(shape, x.dtype(), x.device());
     dx.setRequiresGrad(false);
 
+#ifdef USE_CUDA
+    if (x.device() == Device::CUDA) {
+        if (!x.is_contiguous() || d != ndim - 1 || !pathDownGrad.is_contiguous()) {
+            throw std::runtime_error("CUDA SoftmaxBackward currently requires contiguous tensors and dim == last dimension");
+        }
+        // Recompute s = softmax(x) on device, then dx = s * (dy - dot(dy, s)).
+        Tensor s(shape, x.dtype(), Device::CUDA);
+        s.setRequiresGrad(false);
+        cuda_check_error(
+            cudaMemcpy(s.data(), x.data(), x.numel() * sizeof(float), cudaMemcpyDeviceToDevice),
+            "cudaMemcpy in SoftmaxBackward");
+        cuda_softmax_forward(static_cast<const float*>(s.data()),
+                             static_cast<float*>(s.data()),
+                             outer_size, dim_size);
+        cuda_softmax_backward(static_cast<const float*>(s.data()),
+                              static_cast<const float*>(pathDownGrad.data()),
+                              static_cast<float*>(dx.data()),
+                              outer_size, dim_size);
+        cuda_check_error(cudaGetLastError(), "cuda_softmax backward kernels failed");
+        cuda_check_error(cudaDeviceSynchronize(), "cudaDeviceSynchronize after SoftmaxBackward");
+        return {dx};
+    }
+#endif
+
     std::vector<int64_t> idx(ndim, 0);
 
     for (int64_t outer = 0; outer < outer_size; ++outer) {
@@ -538,5 +658,73 @@ std::vector<Tensor> L1Backward::backward(const Tensor& pathDownGrad) {
 
     grad.setRequiresGrad(false);
     return {grad};
+}
+
+std::vector<Tensor> EmbeddingBackward::backward(const Tensor& pathDownGrad) {
+    const Tensor& indices = inputs[0];
+    const Tensor& weight  = inputs[1];
+
+    const Tensor grad = pathDownGrad.contiguous();
+    std::vector<int64_t> weight_shape = weight.shape();
+    const int64_t D = weight_shape.back();
+    const int64_t total_indices = indices.numel();
+    const int64_t flat_grad_size = grad.numel();
+    (void)flat_grad_size;  // Unused for now; validates shape consistency implicitly.
+
+    // Placeholder gradient for indices (indices are discrete, no meaningful gradient).
+    Tensor d_input(indices.shape(), indices.dtype(), indices.device());
+
+    Tensor d_weight(weight_shape, weight.dtype(), weight.device());
+    d_weight.fill_<float>(0.0f);
+
+    if (d_input.device() == Device::CPU) {
+        d_input.fill_<int64_t>(0);
+    } else {
+#ifdef USE_CUDA
+        size_t d_input_bytes = d_input.numel() * sizeof(int64_t);
+        cuda_check_error(cudaMemset(d_input.data(), 0, d_input_bytes),
+                         "cudaMemset d_input");
+#endif
+    }
+
+    if (grad.device() == Device::CUDA) {
+#ifdef USE_CUDA
+        Tensor d_weight_gpu(weight_shape, weight.dtype(), Device::CUDA);
+        cuda_fill(static_cast<float*>(d_weight_gpu.data()), 0.0f,
+                  static_cast<int64_t>(d_weight_gpu.numel()));
+
+        cuda_embedding_backward(static_cast<const int64_t*>(indices.data()),
+                                static_cast<const float*>(grad.data()),
+                                static_cast<float*>(d_weight_gpu.data()),
+                                static_cast<int>(total_indices),
+                                static_cast<int>(D));
+        cuda_check_error(cudaGetLastError(), "cuda_embedding_backward failed");
+        cuda_check_error(cudaDeviceSynchronize(), "cudaDeviceSynchronize after embedding backward");
+
+        cuda_check_error(
+            cudaMemcpy(d_weight.data(), d_weight_gpu.data(),
+                       static_cast<size_t>(num_embeddings * D * sizeof(float)),
+                       cudaMemcpyDeviceToHost),
+            "cudaMemcpy d_weight D2H");
+#else
+        throw std::runtime_error("CUDA not available");
+#endif
+    } else {
+        const int64_t* idx_data = static_cast<const int64_t*>(indices.data());
+        const float* grad_data = static_cast<const float*>(grad.data());
+        float* dw_data = static_cast<float*>(d_weight.data());
+
+        for (int64_t i = 0; i < total_indices; ++i) {
+            int64_t idx = idx_data[i];
+            if (idx < 0 || idx >= num_embeddings) continue;
+            for (int64_t j = 0; j < D; ++j) {
+                dw_data[idx * D + j] += grad_data[i * D + j];
+            }
+        }
+    }
+
+    d_input.setRequiresGrad(false);
+    d_weight.setRequiresGrad(false);
+    return {d_input, d_weight};
 }
 

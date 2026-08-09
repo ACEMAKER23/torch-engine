@@ -125,4 +125,13 @@ class L1Backward : public GradFn {
 public:
     std::vector<Tensor> backward(const Tensor& pathDownGrad) override;
 };
+
+// Gradient for embedding lookup: inputs[0] = indices, inputs[1] = weight matrix.
+// Backward accumulates d_weight[index] += pathDownGrad[i] for each occurrence.
+class EmbeddingBackward : public GradFn {
+public:
+    int64_t num_embeddings = 0;
+    int64_t embedding_dim = 0;
+    std::vector<Tensor> backward(const Tensor& pathDownGrad) override;
+};
 #endif

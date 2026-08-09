@@ -12,6 +12,19 @@ inline void cuda_check_error(cudaError_t err, const char* message) {
     }
 }
 
+#ifdef USE_CUDA
+#include <cublas_v2.h>
+
+inline void cublas_check_error(cublasStatus_t status, const char* message) {
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        throw std::runtime_error(std::string(message) + ": cublas error " + std::to_string(status));
+    }
+}
+
+// Persistent cuBLAS handle.  Created lazily on first use.
+cublasHandle_t cuda_cublas_handle();
+#endif
+
 // Synchronize CUDA device
 inline void cuda_synchronize() {
     cuda_check_error(cudaDeviceSynchronize(), "cudaDeviceSynchronize failed");

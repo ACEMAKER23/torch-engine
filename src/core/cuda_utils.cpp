@@ -43,3 +43,14 @@ void cuda_init() {
     }
     std::cout << "CUDA initialized. Device: " << cuda_device_name() << std::endl;
 }
+
+#ifdef USE_CUDA
+cublasHandle_t cuda_cublas_handle() {
+    static cublasHandle_t handle = []() {
+        cublasHandle_t h;
+        cublas_check_error(cublasCreate(&h), "cublasCreate");
+        return h;
+    }();
+    return handle;
+}
+#endif

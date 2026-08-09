@@ -2,6 +2,11 @@
 #include "../core/grad_fn.h"
 #include <cmath>
 
+#ifdef USE_CUDA
+#include "../cuda/elementwise_cuda.h"
+#include "../core/cuda_utils.h"
+#endif
+
 LayerNorm::LayerNorm(int64_t normalized_shape, DType dtype, float eps)
     : normalized_shape_(normalized_shape), eps_(eps),
       weight_({normalized_shape}, dtype, Device::CPU),
@@ -25,10 +30,26 @@ Tensor LayerNorm::forward(const Tensor& input) {
     }
     
     Tensor result(input_shape, input.dtype(), input.device());
-    
+
     // Compute mean and variance along the last dimension
     size_t batch_size = input.numel() / last_dim;
-    
+
+#ifdef USE_CUDA
+    if (input.device() == Device::CUDA) {
+        Tensor gamma_dev = weight_.toDevice(Device::CUDA);
+        Tensor beta_dev  = bias_.toDevice(Device::CUDA);
+        cuda_layernorm_forward(static_cast<const float*>(input.data()),
+                               static_cast<const float*>(gamma_dev.data()),
+                               static_cast<const float*>(beta_dev.data()),
+                               static_cast<float*>(result.data()),
+                               static_cast<int>(batch_size),
+                               static_cast<int>(last_dim),
+                               eps_);
+        cuda_check_error(cudaGetLastError(), "cuda_layernorm_forward failed");
+        cuda_check_error(cudaDeviceSynchronize(), "cudaDeviceSynchronize after layernorm forward");
+    } else {
+#endif
+
     for (size_t i = 0; i < batch_size; ++i) {
         // Compute mean
         float mean = 0.0f;
@@ -59,7 +80,10 @@ Tensor LayerNorm::forward(const Tensor& input) {
             }
         }
     }
-    
+#ifdef USE_CUDA
+    }
+#endif
+
     // Attach autograd node whenever any input to the computation requires a gradient.
     // This keeps the gradient flowing through LayerNorm in both directions:
     //   backwards → weight_/bias_ (leaf parameters) and

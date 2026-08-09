@@ -61,6 +61,9 @@ endif()
 
 # Create Tensor library
 add_library(tensor_lib STATIC ${TENSOR_SOURCES})
+if(CUDA_FOUND)
+    target_link_libraries(tensor_lib ${CUDA_LIBRARIES} ${CUDA_cublas_LIBRARY})
+endif()
 
 # Test executable
 add_executable(tensor_test src/tests/tensor_test.cpp)
@@ -84,7 +87,28 @@ if(CUDA_FOUND)
     target_link_libraries(matmul_profile tensor_lib ${CUDA_LIBRARIES} ${CUDA_cublas_LIBRARY})
 
     add_executable(gpt_benchmark src/benchmarks/gpt_benchmark.cpp)
-    target_link_libraries(gpt_benchmark tensor_lib ${CUDA_LIBRARIES})
+    target_link_libraries(gpt_benchmark tensor_lib ${CUDA_LIBRARIES} ${CUDA_cublas_LIBRARY})
+
+    add_executable(cuda_matmul_tensor_test src/tests/cuda_matmul_tensor_test.cpp)
+    target_link_libraries(cuda_matmul_tensor_test tensor_lib ${CUDA_LIBRARIES} ${CUDA_cublas_LIBRARY})
+
+    add_executable(cuda_softmax_tensor_test src/tests/cuda_softmax_tensor_test.cpp)
+    target_link_libraries(cuda_softmax_tensor_test tensor_lib ${CUDA_LIBRARIES} ${CUDA_cublas_LIBRARY})
+
+    add_executable(cuda_layernorm_tensor_test src/tests/cuda_layernorm_tensor_test.cpp)
+    target_link_libraries(cuda_layernorm_tensor_test tensor_lib ${CUDA_LIBRARIES} ${CUDA_cublas_LIBRARY})
+
+    add_executable(cuda_embedding_tensor_test src/tests/cuda_embedding_tensor_test.cpp)
+    target_link_libraries(cuda_embedding_tensor_test tensor_lib ${CUDA_LIBRARIES} ${CUDA_cublas_LIBRARY})
+
+    add_executable(cuda_crossentropy_tensor_test src/tests/cuda_crossentropy_tensor_test.cpp)
+    target_link_libraries(cuda_crossentropy_tensor_test tensor_lib ${CUDA_LIBRARIES} ${CUDA_cublas_LIBRARY})
+
+    add_executable(cuda_gelu_tensor_test src/tests/cuda_gelu_tensor_test.cpp)
+    target_link_libraries(cuda_gelu_tensor_test tensor_lib ${CUDA_LIBRARIES} ${CUDA_cublas_LIBRARY})
+
+    add_executable(cuda_reduction_tensor_test src/tests/cuda_reduction_tensor_test.cpp)
+    target_link_libraries(cuda_reduction_tensor_test tensor_lib ${CUDA_LIBRARIES} ${CUDA_cublas_LIBRARY})
 endif()
 
 # Link libraries

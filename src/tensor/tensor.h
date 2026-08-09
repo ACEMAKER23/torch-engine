@@ -9,6 +9,22 @@
 #include <stdexcept>
 #include "../core/grad_fn.h"
 
+#ifdef USE_CUDA
+#include "../core/cuda_utils.h"
+#include <cuda_runtime.h>
+#include <type_traits>
+
+// Forward declarations of CUDA elementwise helpers used by Tensor methods.
+// (Full declarations live in ../cuda/elementwise_cuda.h to avoid a circular
+// include chain through dtype_utils.h.)
+void cuda_fill(float* data, float value, int64_t size);
+void cuda_reduce_sum(const float* input, float* output, int64_t size);
+void cuda_sum_dim(const float* input, float* output,
+                  const int64_t* in_shape, const int64_t* in_strides,
+                  const int64_t* out_shape, const int64_t* out_strides,
+                  int64_t dim, int64_t ndim, int64_t out_numel, int64_t dim_size);
+#endif
+
 // Forward declarations for low-precision types (defined in dtype_utils.h)
 struct float16_t;
 struct bfloat16_t;
@@ -115,7 +131,7 @@ public:
     Tensor softmax(int64_t dim);
     Tensor softmax(int64_t dim);
 
-    Tensor toDevice(Device targetDevice);
+    Tensor toDevice(Device targetDevice) const;
 
     // Template implementations (must be in header)
     template<typename T>
@@ -308,6 +324,26 @@ public:
 
     template<typename T>
     T sum() {
+        if constexpr (std::is_same_v<T, float>) {
+            if (device() == Device::CUDA) {
+#ifdef USE_CUDA
+                Tensor d_scalar({1}, dtype(), Device::CUDA);
+                cuda_fill(static_cast<float*>(d_scalar.data()), 0.0f, 1);
+                cuda_reduce_sum(static_cast<const float*>(data()),
+                                static_cast<float*>(d_scalar.data()),
+                                static_cast<int64_t>(numel()));
+                cuda_check_error(cudaGetLastError(), "cuda_reduce_sum failed");
+                cuda_check_error(cudaDeviceSynchronize(), "cudaDeviceSynchronize after reduce_sum");
+                float h_scalar = 0.0f;
+                cuda_check_error(
+                    cudaMemcpy(&h_scalar, d_scalar.data(), sizeof(float), cudaMemcpyDeviceToHost),
+                    "cudaMemcpy reduce_sum D2H");
+                return h_scalar;
+#else
+                throw std::runtime_error("CUDA not available");
+#endif
+            }
+        }
         T result = 0;
         for (size_t i = 0; i < numel(); ++i) {
             result += at<T>(i);
@@ -495,6 +531,16 @@ public:
         
         Tensor result(output_shape, a.dtype(), a.impl_->storage()->device());
 
+#ifdef USE_CUDA
+        if (a.device() == Device::CUDA) {
+            if constexpr (std::is_same_v<T, float>) {
+                cuda_matmul_impl_f32(a, b, result, M, K_a, N, batch_shape);
+                return result;
+            }
+            throw runtime_error("CUDA matmul currently only supports Float32");
+        }
+#endif
+
         // Zero-initialise via raw pointer -- at<T>() chases three shared_ptr levels
         // on every element access and costs ~45 µs for a 2048-element tensor vs
         // <1 µs for a plain memset.
@@ -535,6 +581,89 @@ public:
         return result;
     }
     
+    static void cuda_matmul_impl_f32(const Tensor& a, const Tensor& b, Tensor& result,
+                                     int64_t M, int64_t K, int64_t N,
+                                     const std::vector<int64_t>& batch_shape) {
+#ifdef USE_CUDA
+        // cuBLAS is column-major.  We compute row-major C = A * B via the identity
+        // C^T = B^T * A^T, swapping the operands to cuBLAS.  Each 2D slice is
+        // either contiguous row-major (last-dim stride 1) or contiguous column-major
+        // (first-dim stride 1).  For row-major [R, C] we pass op = N with ld = R;
+        // for column-major we pass op = T with ld = C.
+        auto cublas_params = [](int64_t s_row, int64_t s_col) -> std::pair<cublasOperation_t, int> {
+            if (s_col == 1) return {CUBLAS_OP_N, static_cast<int>(s_row)};   // row-major [R, C]
+            if (s_row == 1) return {CUBLAS_OP_T, static_cast<int>(s_col)};   // col-major [R, C]
+            throw std::runtime_error("CUDA matmul only supports row- or column-major 2D slices");
+        };
+
+        size_t ndim_a = a.shape().size();
+        size_t ndim_b = b.shape().size();
+
+        int64_t s_row_a = a.strides()[ndim_a - 2];
+        int64_t s_col_a = a.strides()[ndim_a - 1];
+        int64_t s_row_b = b.strides()[ndim_b - 2];
+        int64_t s_col_b = b.strides()[ndim_b - 1];
+
+        // first cuBLAS arg is our B, interpreted as [N, K]
+        auto paramsA = cublas_params(s_row_b, s_col_b);
+        cublasOperation_t transA = paramsA.first;
+        int lda = paramsA.second;
+        // second cuBLAS arg is our A, interpreted as [K, M]
+        auto paramsB = cublas_params(s_row_a, s_col_a);
+        cublasOperation_t transB = paramsB.first;
+        int ldb = paramsB.second;
+
+        const float* A_ptr = static_cast<const float*>(a.data()); // our A
+        const float* B_ptr = static_cast<const float*>(b.data()); // our B
+        float* C_ptr = static_cast<float*>(result.data());
+
+        const float alpha = 1.0f;
+        const float beta = 0.0f;
+        cublasHandle_t handle = cuda_cublas_handle();
+
+        auto do_gemm = [&](const float* A_batch, const float* B_batch, float* C_batch) {
+            // C^T = B^T * A^T  ->  C is N x M in column-major (ld = N), which is
+            // exactly the storage layout of the row-major [M, N] result tensor.
+            cublas_check_error(
+                cublasSgemm(handle,
+                            transA, transB,
+                            static_cast<int>(N), static_cast<int>(M), static_cast<int>(K),
+                            &alpha,
+                            B_batch, lda,
+                            A_batch, ldb,
+                            &beta,
+                            C_batch, static_cast<int>(N)),
+                "cublasSgemm");
+        };
+
+        if (batch_shape.empty()) {
+            do_gemm(A_ptr, B_ptr, C_ptr);
+        } else {
+            size_t num_batches = 1;
+            for (int64_t dim : batch_shape) num_batches *= dim;
+
+            std::vector<int64_t> batch_indices_multi(batch_shape.size());
+            for (size_t batch_idx = 0; batch_idx < num_batches; ++batch_idx) {
+                size_t temp_idx = batch_idx;
+                for (int i = (int)batch_shape.size() - 1; i >= 0; --i) {
+                    batch_indices_multi[i] = temp_idx % batch_shape[i];
+                    temp_idx /= batch_shape[i];
+                }
+
+                size_t offset_a = compute_batch_offset(a, batch_indices_multi);
+                size_t offset_b = compute_batch_offset(b, batch_indices_multi);
+                size_t offset_result = compute_batch_offset(result, batch_indices_multi);
+
+                do_gemm(A_ptr + offset_a, B_ptr + offset_b, C_ptr + offset_result);
+            }
+        }
+        cuda_check_error(cudaDeviceSynchronize(), "cudaDeviceSynchronize after cublasSgemm");
+#else
+        (void)a; (void)b; (void)result; (void)M; (void)K; (void)N; (void)batch_shape;
+        throw std::runtime_error("CUDA not built into this binary");
+#endif
+    }
+
     template<typename T>
     static void tiled_matmul_2d(const Tensor& a, const Tensor& b, Tensor& c,
                                 size_t offset_a, size_t offset_b, size_t offset_c,

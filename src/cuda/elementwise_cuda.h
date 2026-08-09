@@ -34,6 +34,36 @@ void cuda_relu(const float* input, float* out, int64_t size);
 void cuda_relu(const float16_t* input, float16_t* out, int64_t size);
 void cuda_relu(const bfloat16_t* input, bfloat16_t* out, int64_t size);
 
+void cuda_softmax_forward(const float* x, float* out, int64_t outer_size, int64_t dim_size);
+void cuda_softmax_backward(const float* s, const float* dy, float* out, int64_t outer_size, int64_t dim_size);
+void cuda_fill(float* data, float value, int64_t size);
+
+void cuda_layernorm_forward(const float* x, const float* gamma, const float* beta,
+                            float* out, int batch, int D, float eps);
+void cuda_layernorm_backward(const float* x, const float* gamma, const float* dy,
+                             float* dx, float* dg, float* db,
+                             int batch, int D, float eps);
+
+void cuda_embedding_forward(const int64_t* indices, const float* weight,
+                            float* out, int total_indices, int D);
+void cuda_embedding_backward(const int64_t* indices, const float* grad_out,
+                             float* grad_weight, int total_indices, int D);
+
+void cuda_crossentropy_batched_forward(const float* logits, const int64_t* targets,
+                                       float* loss, int B, int T, int V);
+void cuda_crossentropy_batched_backward(const float* logits, const int64_t* targets,
+                                        float* grad, float scale, int B, int T, int V);
+
+void cuda_gelu(const float* input, float* output, int64_t size);
+void cuda_gelu_backward(const float* input, const float* grad_output,
+                        float* grad_input, int64_t size);
+
+void cuda_reduce_sum(const float* input, float* output, int64_t size);
+void cuda_sum_dim(const float* input, float* output,
+                  const int64_t* in_shape, const int64_t* in_strides,
+                  const int64_t* out_shape, const int64_t* out_strides,
+                  int64_t dim, int64_t ndim, int64_t out_numel, int64_t dim_size);
+
 void cuda_matmul(const float* A, const float* B, float* C, int M, int K, int N);
 void cuda_matmul_shared_memory(const float* A, const float* B, float* C, int M, int K, int N);
 void cuda_matmul_register_blocking(const float* A, const float* B, float* C, int M, int K, int N);

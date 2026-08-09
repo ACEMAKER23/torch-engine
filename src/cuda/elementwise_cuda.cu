@@ -2413,3 +2413,384 @@ void launch_matmul_ampere(
     cudaFree(B_pad);
     cudaFree(C_pad);
 }
+
+// ---------------------------------------------------------------------------
+// Softmax on the last dimension.
+// Treats `x` as contiguous [outer_size, dim_size] row-major and computes
+// softmax for each row in parallel.  Input and output are device pointers.
+// ---------------------------------------------------------------------------
+__global__ void softmax_forward_kernel(const float* x, float* out,
+                                       int64_t outer_size, int64_t dim_size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= outer_size) return;
+
+    const float* x_row = x + idx * dim_size;
+    float* out_row = out + idx * dim_size;
+
+    float max_val = -__int_as_float(0x7f800000);
+    for (int64_t i = 0; i < dim_size; ++i) {
+        max_val = fmaxf(max_val, x_row[i]);
+    }
+
+    float sum = 0.0f;
+    for (int64_t i = 0; i < dim_size; ++i) {
+        float v = expf(x_row[i] - max_val);
+        out_row[i] = v;
+        sum += v;
+    }
+
+    float inv_sum = 1.0f / sum;
+    for (int64_t i = 0; i < dim_size; ++i) {
+        out_row[i] *= inv_sum;
+    }
+}
+
+__global__ void softmax_backward_kernel(const float* s, const float* dy, float* dx,
+                                        int64_t outer_size, int64_t dim_size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= outer_size) return;
+
+    const float* s_row  = s  + idx * dim_size;
+    const float* dy_row = dy + idx * dim_size;
+    float* dx_row = dx + idx * dim_size;
+
+    float dot = 0.0f;
+    for (int64_t i = 0; i < dim_size; ++i) {
+        dot += dy_row[i] * s_row[i];
+    }
+
+    for (int64_t i = 0; i < dim_size; ++i) {
+        dx_row[i] = s_row[i] * (dy_row[i] - dot);
+    }
+}
+
+void cuda_softmax_forward(const float* x, float* out,
+                          int64_t outer_size, int64_t dim_size) {
+    int threads = 256;
+    int blocks = static_cast<int>((outer_size + threads - 1) / threads);
+    softmax_forward_kernel<<<blocks, threads>>>(x, out, outer_size, dim_size);
+}
+
+void cuda_softmax_backward(const float* s, const float* dy, float* out,
+                           int64_t outer_size, int64_t dim_size) {
+    int threads = 256;
+    int blocks = static_cast<int>((outer_size + threads - 1) / threads);
+    softmax_backward_kernel<<<blocks, threads>>>(s, dy, out, outer_size, dim_size);
+}
+
+__global__ void fill_value_kernel(float* data, float value, int64_t size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) data[idx] = value;
+}
+
+void cuda_fill(float* data, float value, int64_t size) {
+    int threads = 256;
+    int blocks = static_cast<int>((size + threads - 1) / threads);
+    fill_value_kernel<<<blocks, threads>>>(data, value, size);
+}
+
+// ---------------------------------------------------------------------------
+// LayerNorm on the last dimension.
+// ---------------------------------------------------------------------------
+__global__ void layernorm_forward_kernel(const float* x, const float* gamma, const float* beta,
+                                         float* out, int batch, int D, float eps) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch) return;
+
+    const float* xrow = x + idx * D;
+    float* outrow = out + idx * D;
+
+    float mean = 0.0f;
+    for (int j = 0; j < D; ++j) mean += xrow[j];
+    mean /= D;
+
+    float var = 0.0f;
+    for (int j = 0; j < D; ++j) {
+        float d = xrow[j] - mean;
+        var += d * d;
+    }
+    var /= D;
+    float inv_std = rsqrtf(var + eps);
+
+    for (int j = 0; j < D; ++j) {
+        float normalized = (xrow[j] - mean) * inv_std;
+        outrow[j] = normalized * gamma[j] + beta[j];
+    }
+}
+
+__global__ void layernorm_backward_kernel(const float* x, const float* gamma, const float* dy,
+                                          float* dx, float* dg, float* db,
+                                          int batch, int D, float eps) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batch) return;
+
+    const float* xrow  = x  + idx * D;
+    const float* dyrow = dy + idx * D;
+    float* dxrow = dx + idx * D;
+
+    float mean = 0.0f;
+    for (int j = 0; j < D; ++j) mean += xrow[j];
+    mean /= D;
+
+    float var = 0.0f;
+    for (int j = 0; j < D; ++j) {
+        float d = xrow[j] - mean;
+        var += d * d;
+    }
+    var /= D;
+    float inv_std = rsqrtf(var + eps);
+
+    // Accumulate d_gamma and d_beta across the batch using global atomics.
+    for (int j = 0; j < D; ++j) {
+        float x_hat = (xrow[j] - mean) * inv_std;
+        atomicAdd(&dg[j], dyrow[j] * x_hat);
+        atomicAdd(&db[j], dyrow[j]);
+    }
+
+    // Per-row means for the dx formula.
+    float mean_g_dy = 0.0f;
+    float mean_g_dy_xhat = 0.0f;
+    for (int j = 0; j < D; ++j) {
+        float x_hat = (xrow[j] - mean) * inv_std;
+        float g_dy = gamma[j] * dyrow[j];
+        mean_g_dy += g_dy;
+        mean_g_dy_xhat += g_dy * x_hat;
+    }
+    mean_g_dy /= D;
+    mean_g_dy_xhat /= D;
+
+    for (int j = 0; j < D; ++j) {
+        float x_hat = (xrow[j] - mean) * inv_std;
+        dxrow[j] = (gamma[j] * dyrow[j] - mean_g_dy - x_hat * mean_g_dy_xhat) * inv_std;
+    }
+}
+
+void cuda_layernorm_forward(const float* x, const float* gamma, const float* beta,
+                            float* out, int batch, int D, float eps) {
+    int threads = 256;
+    int blocks = (batch + threads - 1) / threads;
+    layernorm_forward_kernel<<<blocks, threads>>>(x, gamma, beta, out, batch, D, eps);
+}
+
+void cuda_layernorm_backward(const float* x, const float* gamma, const float* dy,
+                             float* dx, float* dg, float* db,
+                             int batch, int D, float eps) {
+    int threads = 256;
+    int blocks = (batch + threads - 1) / threads;
+    layernorm_backward_kernel<<<blocks, threads>>>(x, gamma, dy, dx, dg, db, batch, D, eps);
+}
+
+// ---------------------------------------------------------------------------
+// Embedding lookup and embedding_grad.
+// ---------------------------------------------------------------------------
+__global__ void embedding_forward_kernel(const int64_t* indices, const float* weight,
+                                         float* out, int total_indices, int D) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_indices * D) return;
+    int i = idx / D;
+    int j = idx % D;
+    int64_t emb_idx = indices[i];
+    out[idx] = weight[emb_idx * D + j];
+}
+
+__global__ void embedding_backward_kernel(const int64_t* indices, const float* grad_out,
+                                          float* grad_weight, int total_indices, int D) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_indices * D) return;
+    int i = idx / D;
+    int j = idx % D;
+    int64_t emb_idx = indices[i];
+    atomicAdd(&grad_weight[emb_idx * D + j], grad_out[idx]);
+}
+
+void cuda_embedding_forward(const int64_t* indices, const float* weight,
+                            float* out, int total_indices, int D) {
+    int threads = 256;
+    int blocks = (total_indices * D + threads - 1) / threads;
+    embedding_forward_kernel<<<blocks, threads>>>(indices, weight, out, total_indices, D);
+}
+
+void cuda_embedding_backward(const int64_t* indices, const float* grad_out,
+                             float* grad_weight, int total_indices, int D) {
+    int threads = 256;
+    int blocks = (total_indices * D + threads - 1) / threads;
+    embedding_backward_kernel<<<blocks, threads>>>(indices, grad_out, grad_weight, total_indices, D);
+}
+
+// ---------------------------------------------------------------------------
+// Cross-entropy loss over 3D logits [B, T, V] and 2D int64 targets [B, T].
+// ---------------------------------------------------------------------------
+__global__ void crossentropy_batched_forward_kernel(const float* logits,
+                                                    const int64_t* targets,
+                                                    float* loss,
+                                                    int B, int T, int V) {
+    int n = blockIdx.x * blockDim.x + threadIdx.x;
+    int N = B * T;
+    if (n >= N) return;
+
+    const float* row = logits + n * V;
+    int target_class = static_cast<int>(targets[n]);
+
+    float max_logit = row[0];
+    for (int v = 1; v < V; ++v) {
+        max_logit = fmaxf(max_logit, row[v]);
+    }
+
+    float sum_exp = 0.0f;
+    for (int v = 0; v < V; ++v) {
+        sum_exp += expf(row[v] - max_logit);
+    }
+
+    float logit_target = row[target_class];
+    float row_loss = -logit_target + max_logit + logf(sum_exp);
+    atomicAdd(loss, row_loss);
+}
+
+__global__ void crossentropy_batched_backward_kernel(const float* logits,
+                                                     const int64_t* targets,
+                                                     float* grad,
+                                                     float scale,
+                                                     int B, int T, int V) {
+    int n = blockIdx.x * blockDim.x + threadIdx.x;
+    int N = B * T;
+    if (n >= N) return;
+
+    const float* row = logits + n * V;
+    float* grad_row = grad + n * V;
+    int target_class = static_cast<int>(targets[n]);
+
+    float max_logit = row[0];
+    for (int v = 1; v < V; ++v) {
+        max_logit = fmaxf(max_logit, row[v]);
+    }
+
+    float sum_exp = 0.0f;
+    for (int v = 0; v < V; ++v) {
+        sum_exp += expf(row[v] - max_logit);
+    }
+
+    for (int v = 0; v < V; ++v) {
+        float softmax_val = expf(row[v] - max_logit) / sum_exp;
+        float one_hot = (v == target_class) ? 1.0f : 0.0f;
+        grad_row[v] = (softmax_val - one_hot) * scale;
+    }
+}
+
+void cuda_crossentropy_batched_forward(const float* logits, const int64_t* targets,
+                                       float* loss, int B, int T, int V) {
+    int N = B * T;
+    int threads = 256;
+    int blocks = (N + threads - 1) / threads;
+    crossentropy_batched_forward_kernel<<<blocks, threads>>>(logits, targets, loss, B, T, V);
+}
+
+void cuda_crossentropy_batched_backward(const float* logits, const int64_t* targets,
+                                        float* grad, float scale,
+                                        int B, int T, int V) {
+    int N = B * T;
+    int threads = 256;
+    int blocks = (N + threads - 1) / threads;
+    crossentropy_batched_backward_kernel<<<blocks, threads>>>(logits, targets, grad, scale, B, T, V);
+}
+
+// ---------------------------------------------------------------------------
+// GELU forward and backward (tanh approximation).
+// ---------------------------------------------------------------------------
+__global__ void gelu_forward_kernel(const float* input, float* output, int64_t size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    float x = input[idx];
+    float x3 = x * x * x;
+    output[idx] = 0.5f * x * (1.0f + tanhf(0.7978845608f * (x + 0.044715f * x3)));
+}
+
+__global__ void gelu_backward_kernel(const float* input, const float* grad_output,
+                                     float* grad_input, int64_t size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    float x = input[idx];
+    float dy = grad_output[idx];
+    float c = 0.7978845608f;
+    float k = 0.044715f;
+    float x_cubed = x * x * x;
+    float z = c * (x + k * x_cubed);
+    float t = tanhf(z);
+    float sech_sq = 1.0f - t * t;
+    float inner = c * (1.0f + 3.0f * k * x * x);
+    float gelu_grad = 0.5f * (1.0f + t) * (1.0f + x * sech_sq * inner);
+    grad_input[idx] = dy * gelu_grad;
+}
+
+void cuda_gelu(const float* input, float* output, int64_t size) {
+    int threads = 256;
+    int blocks = static_cast<int>((size + threads - 1) / threads);
+    gelu_forward_kernel<<<blocks, threads>>>(input, output, size);
+}
+
+void cuda_gelu_backward(const float* input, const float* grad_output,
+                        float* grad_input, int64_t size) {
+    int threads = 256;
+    int blocks = static_cast<int>((size + threads - 1) / threads);
+    gelu_backward_kernel<<<blocks, threads>>>(input, grad_output, grad_input, size);
+}
+
+// ---------------------------------------------------------------------------
+// Reductions: full sum and sum over a single dimension (up to 8 dimensions).
+// ---------------------------------------------------------------------------
+__global__ void reduce_sum_kernel(const float* input, float* output, int64_t size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    atomicAdd(output, input[idx]);
+}
+
+__global__ void sum_dim_kernel(const float* input, float* output,
+                               const int64_t* in_shape,
+                               const int64_t* in_strides,
+                               const int64_t* out_shape,
+                               const int64_t* out_strides,
+                               int64_t dim, int64_t ndim,
+                               int64_t out_numel, int64_t dim_size) {
+    int64_t out_flat = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (out_flat >= out_numel) return;
+
+    int64_t out_indices[8];
+    int64_t temp = out_flat;
+    int64_t ndim_out = ndim - 1;
+    for (int64_t i = ndim_out - 1; i >= 0; --i) {
+        out_indices[i] = temp % out_shape[i];
+        temp /= out_shape[i];
+    }
+
+    int64_t base = 0;
+    for (int64_t d = 0; d < dim; ++d) {
+        base += out_indices[d] * in_strides[d];
+    }
+    for (int64_t d = dim; d < ndim_out; ++d) {
+        base += out_indices[d] * in_strides[d + 1];
+    }
+
+    float sum = 0.0f;
+    int64_t stride = in_strides[dim];
+    for (int64_t i = 0; i < dim_size; ++i) {
+        sum += input[base + i * stride];
+    }
+    output[out_flat] = sum;
+}
+
+void cuda_reduce_sum(const float* input, float* output, int64_t size) {
+    int threads = 256;
+    int blocks = static_cast<int>((size + threads - 1) / threads);
+    reduce_sum_kernel<<<blocks, threads>>>(input, output, size);
+}
+
+void cuda_sum_dim(const float* input, float* output,
+                  const int64_t* in_shape, const int64_t* in_strides,
+                  const int64_t* out_shape, const int64_t* out_strides,
+                  int64_t dim, int64_t ndim, int64_t out_numel, int64_t dim_size) {
+    int threads = 256;
+    int blocks = static_cast<int>((out_numel + threads - 1) / threads);
+    sum_dim_kernel<<<blocks, threads>>>(input, output,
+                                        in_shape, in_strides,
+                                        out_shape, out_strides,
+                                        dim, ndim, out_numel, dim_size);
+}

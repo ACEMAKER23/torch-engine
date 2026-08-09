@@ -9,6 +9,8 @@
 #include <cmath>
 #include <optional>
 #include <stack>
+#include <type_traits>
+
 
 #ifdef USE_CUDA
 #include "../cuda/elementwise_cuda.h"
@@ -81,8 +83,16 @@ Tensor Tensor::clone() const{
     auto allocator = impl_->storage()->allocator();
     auto storage = Storage::allocate(bt, allocator);
 
-    std::memcpy(storage->data(), impl_->storage()->data(),bt);
-
+    if (devi == Device::CUDA) {
+#ifdef USE_CUDA
+        cuda_check_error(cudaMemcpy(storage->data(), impl_->storage()->data(), bt, cudaMemcpyDeviceToDevice),
+                         "cudaMemcpy in clone");
+#else
+        throw std::runtime_error("CUDA not available");
+#endif
+    } else {
+        std::memcpy(storage->data(), impl_->storage()->data(), bt);
+    }
 
     return (Tensor(storage,impl_->shape(),dty));
 }
@@ -513,6 +523,16 @@ Tensor Tensor::gelu() const {
     Tensor result = clone();
     switch (impl_->dtype()) {
         case DType::Float32:
+#ifdef USE_CUDA
+            if (device() == Device::CUDA) {
+                cuda_gelu(static_cast<const float*>(data()),
+                          static_cast<float*>(result.data()),
+                          static_cast<int64_t>(numel()));
+                cuda_check_error(cudaGetLastError(), "cuda_gelu failed");
+                cuda_check_error(cudaDeviceSynchronize(), "cudaDeviceSynchronize after gelu");
+                break;
+            }
+#endif
             result.gelu_<float>();
             break;
         case DType::Int32:
@@ -665,6 +685,68 @@ Tensor Tensor::sum(int64_t dim) const {
 
 template<typename T>
 void Tensor::sum_impl(Tensor& result, int64_t dim) const {
+    if constexpr (std::is_same_v<T, float>) {
+        if (device() == Device::CUDA) {
+#ifdef USE_CUDA
+            Tensor input_c = contiguous();
+            const std::vector<int64_t>& in_shape = input_c.shape();
+            const std::vector<int64_t>& out_shape = result.shape();
+            int64_t ndim = static_cast<int64_t>(in_shape.size());
+            if (ndim > 8) {
+                throw std::runtime_error("CUDA sum supports up to 8 dimensions");
+            }
+
+            int64_t in_shape_h[8] = {};
+            int64_t in_strides_h[8] = {};
+            int64_t out_shape_h[8] = {};
+            int64_t out_strides_h[8] = {};
+            int64_t stride = 1;
+            for (int64_t i = ndim - 1; i >= 0; --i) {
+                in_shape_h[i] = in_shape[i];
+                in_strides_h[i] = stride;
+                stride *= in_shape[i];
+            }
+            int64_t ndim_out = ndim - 1;
+            stride = 1;
+            for (int64_t i = ndim_out - 1; i >= 0; --i) {
+                out_shape_h[i] = out_shape[i];
+                out_strides_h[i] = stride;
+                stride *= out_shape[i];
+            }
+
+            size_t bytes_i = static_cast<size_t>(ndim) * sizeof(int64_t);
+            size_t bytes_o = static_cast<size_t>(ndim_out) * sizeof(int64_t);
+            int64_t *d_in_shape = nullptr, *d_in_strides = nullptr;
+            int64_t *d_out_shape = nullptr, *d_out_strides = nullptr;
+            cuda_check_error(cudaMalloc(&d_in_shape, bytes_i), "cudaMalloc d_in_shape");
+            cuda_check_error(cudaMalloc(&d_in_strides, bytes_i), "cudaMalloc d_in_strides");
+            cuda_check_error(cudaMalloc(&d_out_shape, bytes_o), "cudaMalloc d_out_shape");
+            cuda_check_error(cudaMalloc(&d_out_strides, bytes_o), "cudaMalloc d_out_strides");
+            cuda_check_error(cudaMemcpy(d_in_shape, in_shape_h, bytes_i, cudaMemcpyHostToDevice), "H2D d_in_shape");
+            cuda_check_error(cudaMemcpy(d_in_strides, in_strides_h, bytes_i, cudaMemcpyHostToDevice), "H2D d_in_strides");
+            cuda_check_error(cudaMemcpy(d_out_shape, out_shape_h, bytes_o, cudaMemcpyHostToDevice), "H2D d_out_shape");
+            cuda_check_error(cudaMemcpy(d_out_strides, out_strides_h, bytes_o, cudaMemcpyHostToDevice), "H2D d_out_strides");
+
+            cuda_fill(static_cast<float*>(result.data()), 0.0f, static_cast<int64_t>(result.numel()));
+            cuda_sum_dim(static_cast<const float*>(input_c.data()),
+                         static_cast<float*>(result.data()),
+                         d_in_shape, d_in_strides,
+                         d_out_shape, d_out_strides,
+                         dim, ndim, static_cast<int64_t>(result.numel()), in_shape[dim]);
+            cuda_check_error(cudaGetLastError(), "cuda_sum_dim failed");
+            cuda_check_error(cudaDeviceSynchronize(), "cudaDeviceSynchronize after sum_dim");
+
+            cuda_check_error(cudaFree(d_in_shape), "cudaFree d_in_shape");
+            cuda_check_error(cudaFree(d_in_strides), "cudaFree d_in_strides");
+            cuda_check_error(cudaFree(d_out_shape), "cudaFree d_out_shape");
+            cuda_check_error(cudaFree(d_out_strides), "cudaFree d_out_strides");
+            return;
+#else
+            throw std::runtime_error("CUDA not available");
+#endif
+        }
+    }
+
     const std::vector<int64_t>& in_shape = shape();
     const std::vector<int64_t>& out_shape = result.shape();
 
@@ -742,8 +824,18 @@ Tensor Tensor::broadcast(const std::vector<int64_t>& target_shape) const {
 void Tensor::backward() {
     // Seed gradient is ones with the same shape as this tensor (d(loss)/d(loss) = 1).
     Tensor grad_output(impl_->shape(), impl_->dtype(), impl_->storage()->device());
-    for (size_t i = 0; i < grad_output.numel(); ++i) {
-        grad_output.at<float>(i) = 1.0f;
+    if (grad_output.device() == Device::CUDA) {
+#ifdef USE_CUDA
+        cuda_fill(static_cast<float*>(grad_output.data()), 1.0f,
+                  static_cast<int64_t>(grad_output.numel()));
+        cuda_check_error(cudaGetLastError(), "cuda_fill failed");
+#else
+        throw std::runtime_error("CUDA not supported in this build");
+#endif
+    } else {
+        for (size_t i = 0; i < grad_output.numel(); ++i) {
+            grad_output.at<float>(i) = 1.0f;
+        }
     }
 
     // Call private implementation
@@ -806,6 +898,37 @@ Tensor Tensor::softmax(int64_t dim) {
     T* data = static_cast<T*>(out.data());
     // out.strides() are the standard row-major strides for sh.
     const auto& out_st = out.strides();
+
+#ifdef USE_CUDA
+    if (impl_->storage()->device() == Device::CUDA) {
+        if (is_contiguous() && dim == ndim - 1) {
+            // Fast GPU path: copy contiguous input to contiguous output and
+            // launch a per-row softmax kernel.
+            cuda_check_error(
+                cudaMemcpy(out.data(), this->data(),
+                           impl_->numel() * sizeof(T), cudaMemcpyDeviceToDevice),
+                "cudaMemcpy in softmax");
+
+            int64_t dim_size = sh[dim];
+            int64_t outer_size = static_cast<int64_t>(out.numel()) / dim_size;
+            cuda_softmax_forward(static_cast<const float*>(out.data()),
+                                 static_cast<float*>(out.data()),
+                                 outer_size, dim_size);
+            cuda_check_error(cudaGetLastError(), "cuda_softmax_forward failed");
+            cuda_check_error(cudaDeviceSynchronize(), "cudaDeviceSynchronize after softmax");
+
+            if (requiredGrad()) {
+                auto fn = std::make_shared<SoftmaxBackward>();
+                fn->inputs = {*this};
+                fn->dim = dim;
+                out.impl_->set_grad_fn(fn);
+                out.impl_->set_requires_grad(true);
+            }
+            return out;
+        }
+        throw std::runtime_error("CUDA softmax currently requires contiguous input and dim == last dimension");
+    }
+#endif
 
     // Copy *this into out, element by element, using *this's strides for reading
     // and out's (row-major) strides for writing.
@@ -897,7 +1020,7 @@ Tensor Tensor::softmax(int64_t dim) {
 }
 
 
-Tensor Tensor::toDevice(Device targetDevice){
+Tensor Tensor::toDevice(Device targetDevice) const {
     if (device() == targetDevice) {
         return *this;
     }

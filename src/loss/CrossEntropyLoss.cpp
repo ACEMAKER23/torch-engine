@@ -2,6 +2,11 @@
 #include "../core/grad_fn.h"
 #include <cmath>
 
+#ifdef USE_CUDA
+#include "../cuda/elementwise_cuda.h"
+#include "../core/cuda_utils.h"
+#endif
+
 Tensor crossEntropyLoss::forward(const Tensor& predictions, const Tensor& targets) {
     // PyTorch-style: predictions are raw logits, targets are class indices (int64)
     // Loss = -log(softmax(logits)[target]) = -logits[target] + log(sum(exp(logits)))
@@ -54,6 +59,41 @@ Tensor crossEntropyLoss::forward_batched(const Tensor& predictions, const Tensor
     int64_t V = logShape[2];
     int64_t N = B * T;
 
+    Tensor loss({1}, DType::Float32, predictions.device());
+    auto grad_fn = std::make_shared<CrossEntropyBatchedBackward>();
+    grad_fn->inputs.push_back(predictions);
+    grad_fn->inputs.push_back(targets);
+    loss.setGradFn(grad_fn);
+
+    if (predictions.device() == Device::CUDA) {
+#ifdef USE_CUDA
+        Tensor logits  = predictions.contiguous();
+        Tensor tgt     = targets.contiguous();
+
+        cuda_fill(static_cast<float*>(loss.data()), 0.0f, 1);
+        cuda_check_error(cudaGetLastError(), "cuda_fill loss");
+        cuda_crossentropy_batched_forward(
+            static_cast<const float*>(logits.data()),
+            static_cast<const int64_t*>(tgt.data()),
+            static_cast<float*>(loss.data()),
+            static_cast<int>(B), static_cast<int>(T), static_cast<int>(V));
+        cuda_check_error(cudaGetLastError(), "cuda_crossentropy_batched_forward failed");
+        cuda_check_error(cudaDeviceSynchronize(), "cudaDeviceSynchronize after crossentropy forward");
+
+        float loss_h = 0.0f;
+        cuda_check_error(
+            cudaMemcpy(&loss_h, loss.data(), sizeof(float), cudaMemcpyDeviceToHost),
+            "cudaMemcpy loss D2H");
+        loss_h /= static_cast<float>(N);
+        cuda_check_error(
+            cudaMemcpy(loss.data(), &loss_h, sizeof(float), cudaMemcpyHostToDevice),
+            "cudaMemcpy loss H2D");
+        return loss;
+#else
+        throw std::runtime_error("CUDA not available");
+#endif
+    }
+
     const float* logits_ptr = static_cast<const float*>(predictions.data());
     const int64_t* targets_ptr = static_cast<const int64_t*>(targets.data());
     const std::vector<int64_t>& ls = predictions.strides();
@@ -81,13 +121,7 @@ Tensor crossEntropyLoss::forward_batched(const Tensor& predictions, const Tensor
         }
     }
 
-    Tensor loss({1}, DType::Float32, predictions.device());
     loss.at<float>(0) = static_cast<float>(total_loss / static_cast<double>(N));
-
-    auto grad_fn = std::make_shared<CrossEntropyBatchedBackward>();
-    grad_fn->inputs.push_back(predictions);
-    grad_fn->inputs.push_back(targets);
-    loss.setGradFn(grad_fn);
     return loss;
 }
 
