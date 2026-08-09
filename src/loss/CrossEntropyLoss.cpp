@@ -39,6 +39,58 @@ Tensor crossEntropyLoss::forward(const Tensor& predictions, const Tensor& target
     return loss;
 }
 
+Tensor crossEntropyLoss::forward_batched(const Tensor& predictions, const Tensor& targets) {
+    auto logShape = predictions.shape();
+    if (logShape.size() != 3) {
+        throw std::runtime_error("forward_batched expects 3D logits [B, T, V]");
+    }
+    auto tgtShape = targets.shape();
+    if (tgtShape.size() != 2) {
+        throw std::runtime_error("forward_batched expects 2D targets [B, T]");
+    }
+
+    int64_t B = logShape[0];
+    int64_t T = logShape[1];
+    int64_t V = logShape[2];
+    int64_t N = B * T;
+
+    const float* logits_ptr = static_cast<const float*>(predictions.data());
+    const int64_t* targets_ptr = static_cast<const int64_t*>(targets.data());
+    const std::vector<int64_t>& ls = predictions.strides();
+    const std::vector<int64_t>& ts = targets.strides();
+
+    double total_loss = 0.0;
+    for (int64_t b = 0; b < B; ++b) {
+        for (int64_t t = 0; t < T; ++t) {
+            const float* row = logits_ptr + b * ls[0] + t * ls[1];
+            int64_t target_class = targets_ptr[b * ts[0] + t * ts[1]];
+
+            float max_logit = row[0];
+            for (int64_t v = 1; v < V; ++v) {
+                max_logit = std::max(max_logit, row[v * ls[2]]);
+            }
+
+            float sum_exp = 0.0f;
+            for (int64_t v = 0; v < V; ++v) {
+                sum_exp += std::exp(row[v * ls[2]] - max_logit);
+            }
+            float log_sum_exp = max_logit + std::log(sum_exp);
+            float logit_target = row[target_class * ls[2]];
+
+            total_loss += (-logit_target + log_sum_exp);
+        }
+    }
+
+    Tensor loss({1}, DType::Float32, predictions.device());
+    loss.at<float>(0) = static_cast<float>(total_loss / static_cast<double>(N));
+
+    auto grad_fn = std::make_shared<CrossEntropyBatchedBackward>();
+    grad_fn->inputs.push_back(predictions);
+    grad_fn->inputs.push_back(targets);
+    loss.setGradFn(grad_fn);
+    return loss;
+}
+
 Tensor crossEntropyLoss::forward_with_probs(const Tensor& predictions, const Tensor& targets) {
     // Probability-based: predictions are softmax probabilities, targets are class indices (int64)
     // Loss = -log(probabilities[target])                                                                                                                                                                   

@@ -74,8 +74,8 @@ TEST(TensorTest, ViewReshape) {
     
     auto original_storage = a.impl_->storage();
     
-    // View reshape
-    a.view({3, 2});
+    // View reshape returns a new tensor with shared storage.
+    a = a.view({3, 2});
     
     EXPECT_EQ(a.shape().size(), 2);
     EXPECT_EQ(a.shape()[0], 3);
@@ -861,28 +861,32 @@ TEST(TensorTest, FillZero) {
 
 TEST(TensorTest, ContiguousBasic) {
     Tensor a({2, 3}, DType::Float32, Device::CPU);
-    
+
     // Initialize with some values
     float* data = static_cast<float*>(a.data());
     for (size_t i = 0; i < a.numel(); ++i) {
         data[i] = static_cast<float>(i);
     }
-    
+
     Tensor b = a.contiguous();
-    
+
     // Check shape is preserved
     EXPECT_EQ(b.shape()[0], 2);
     EXPECT_EQ(b.shape()[1], 3);
-    
+
     // Check data is copied correctly
     const float* b_data = static_cast<const float*>(b.data());
     for (size_t i = 0; i < b.numel(); ++i) {
         EXPECT_FLOAT_EQ(b_data[i], static_cast<float>(i));
     }
-    
-    // Modify original and check contiguous copy is unchanged (proves it's a deep copy)
+
+    // If 'a' is already contiguous, contiguous() returns *this (PyTorch-style no-copy short-cut).
+    // In that case modifying 'a' in-place also changes 'b'.
     data[0] = 999.0f;
-    EXPECT_FLOAT_EQ(b_data[0], 0.0f);
+    EXPECT_FLOAT_EQ(b_data[0], 999.0f);
+
+    // The deep-copy guarantee is only provided for non-contiguous inputs.
+    EXPECT_TRUE(a.is_contiguous());
 }
 
 TEST(TensorTest, ContiguousAfterTranspose) {

@@ -7,11 +7,12 @@ Dropout::Dropout(float p) : p_(p), training_(true), gen_(std::random_device{}())
 }
 
 Tensor Dropout::forward(const Tensor& input) {
-    Tensor result = input.clone();
-
-    if (!training_) {
-        return result; // no scaling in inference
+    // Identity pass-through: preserve the autograd graph
+    if (!training_ || p_ == 0.0f) {
+        return input;
     }
+
+    Tensor result = input.clone();
 
     float keep_prob = 1.0f - p_;
     float scale = 1.0f / keep_prob;

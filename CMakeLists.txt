@@ -74,6 +74,7 @@ add_executable(loss_test src/tests/loss_test.cpp)
 add_executable(mixed_precision_test src/tests/mixed_precision_test.cpp)
 add_executable(end_to_end_test src/tests/end_to_end_test.cpp)
 add_executable(cuda_test src/tests/cuda_test.cpp)
+add_executable(mha_grad_check2 src/tests/mha_grad_check2.cpp)
 
 if(CUDA_FOUND)
     add_executable(matmul_benchmark src/benchmarks/matmul_benchmark.cpp)
@@ -81,6 +82,9 @@ if(CUDA_FOUND)
 
     add_executable(matmul_profile src/benchmarks/matmul_profile.cpp)
     target_link_libraries(matmul_profile tensor_lib ${CUDA_LIBRARIES} ${CUDA_cublas_LIBRARY})
+
+    add_executable(gpt_benchmark src/benchmarks/gpt_benchmark.cpp)
+    target_link_libraries(gpt_benchmark tensor_lib ${CUDA_LIBRARIES})
 endif()
 
 # Link libraries
@@ -96,6 +100,7 @@ if(CUDA_FOUND)
     target_link_libraries(mixed_precision_test tensor_lib GTest::GTest GTest::Main ${CUDA_LIBRARIES})
     target_link_libraries(end_to_end_test tensor_lib GTest::GTest GTest::Main ${CUDA_LIBRARIES})
     target_link_libraries(cuda_test tensor_lib GTest::GTest GTest::Main ${CUDA_LIBRARIES} ${CUDA_cublas_LIBRARY})
+    target_link_libraries(mha_grad_check2 tensor_lib ${CUDA_LIBRARIES})
 else()
     target_link_libraries(tensor_test tensor_lib GTest::GTest GTest::Main)
     target_link_libraries(autograd_test tensor_lib GTest::GTest GTest::Main)
@@ -108,6 +113,7 @@ else()
     target_link_libraries(mixed_precision_test tensor_lib GTest::GTest GTest::Main)
     target_link_libraries(end_to_end_test tensor_lib GTest::GTest GTest::Main)
     target_link_libraries(cuda_test tensor_lib GTest::GTest GTest::Main)
+    target_link_libraries(mha_grad_check2 tensor_lib)
 endif()
 
 # Enable testing

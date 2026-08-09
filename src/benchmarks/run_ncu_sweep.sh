@@ -9,7 +9,7 @@
 # Output: one .ncu-rep report per (kernel, shape) pair under ./ncu_reports/
 
 set -e
-NCU=/usr/local/cuda-13.2/bin/ncu
+NCU=${NCU:-/usr/local/cuda-13.2/bin/ncu}
 BIN=./matmul_profile
 OUTDIR=./ncu_reports
 mkdir -p "$OUTDIR"

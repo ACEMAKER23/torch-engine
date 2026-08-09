@@ -1,4 +1,5 @@
 #include "layernorm.h"
+#include "../core/grad_fn.h"
 #include <cmath>
 
 LayerNorm::LayerNorm(int64_t normalized_shape, DType dtype, float eps)
@@ -59,6 +60,18 @@ Tensor LayerNorm::forward(const Tensor& input) {
         }
     }
     
+    // Attach autograd node whenever any input to the computation requires a gradient.
+    // This keeps the gradient flowing through LayerNorm in both directions:
+    //   backwards → weight_/bias_ (leaf parameters) and
+    //   backwards → input x (so upstream blocks stay connected).
+    if (input.requiredGrad() || weight_.requiredGrad() || bias_.requiredGrad()) {
+        auto fn = std::make_shared<LayerNormBackward>();
+        fn->inputs = {input, weight_, bias_};
+        fn->eps    = eps_;
+        result.setGradFn(fn);
+        result.setRequiresGrad(true);
+    }
+
     return result;
 }
 
@@ -89,5 +102,8 @@ std::vector<Tensor> LayerNorm::parameters() {
 }
 
 void LayerNorm::zero_grad() {
-    // Gradients are cleared by the tensor implementation during backward
+    if (weight_.grad() && weight_.dtype() == DType::Float32)
+        weight_.grad()->fill_<float>(0.0f);
+    if (bias_.grad() && bias_.dtype() == DType::Float32)
+        bias_.grad()->fill_<float>(0.0f);
 }

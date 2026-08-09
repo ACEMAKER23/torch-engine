@@ -9,10 +9,10 @@
 #include <cmath>
 #include <optional>
 #include <stack>
-#include "../cuda/elementwise_cuda.h"
-#include "../core/cuda_utils.h"
 
 #ifdef USE_CUDA
+#include "../cuda/elementwise_cuda.h"
+#include "../core/cuda_utils.h"
 // Generic dispatcher for CUDA binary elementwise operations
 template<typename Op>
 void dispatch_cuda_binary_op(const Tensor& a, const Tensor& b, Tensor& result, Op op) {
@@ -87,12 +87,30 @@ Tensor Tensor::clone() const{
     return (Tensor(storage,impl_->shape(),dty));
 }
 
+bool Tensor::is_contiguous() const {
+    const auto& sh = impl_->shape();
+    const auto& st = impl_->strides();
+    if (sh.empty()) return true;
+    int64_t expected = 1;
+    for (int64_t i = (int64_t)sh.size() - 1; i >= 0; --i) {
+        if (st[i] != expected) return false;
+        expected *= sh[i];
+    }
+    return true;
+}
+
 Tensor Tensor::contiguous() const {
-    // Create a new tensor with contiguous memory layout
-    // This is similar to clone() but ensures proper strides
+    // Already contiguous: return a shallow copy of this tensor. No copy node
+    // is needed in the autograd graph because it is an identity.
+    if (is_contiguous()) {
+        return *this;
+    }
+
+    // Not contiguous: allocate fresh row-major storage and copy the logical
+    // elements following the original (possibly strided) layout.
     size_t numElements = impl_->numel();
     size_t elementSize = 0;
-    
+
     switch (impl_->dtype()) {
         case DType::Float32:
             elementSize = sizeof(float);
@@ -106,49 +124,78 @@ Tensor Tensor::contiguous() const {
         default:
             throw runtime_error("Unsupported dtype for contiguous");
     }
-    
+
     size_t totalBytes = numElements * elementSize;
     auto allocator = impl_->storage()->allocator();
     auto storage = Storage::allocate(totalBytes, allocator);
-    
-    // Copy data element-wise to ensure contiguity
+
     const void* srcData = impl_->storage()->data();
     void* dstData = storage->data();
-    
+    const auto& shape = impl_->shape();
+    const auto& strides = impl_->strides();
+    size_t offset = impl_->offset();
+    size_t ndim = shape.size();
+
+    auto copy_loop = [&](auto* dst, const auto* src) {
+        std::vector<int64_t> idx(ndim, 0);
+        for (size_t flat = 0; flat < numElements; ++flat) {
+            size_t srcOffset = offset;
+            for (size_t d = 0; d < ndim; ++d) {
+                srcOffset += idx[d] * strides[d];
+            }
+            dst[flat] = src[srcOffset];
+
+            // Increment multi-index
+            for (int d = (int)ndim - 1; d >= 0; --d) {
+                if (++idx[d] < shape[d]) break;
+                idx[d] = 0;
+            }
+        }
+    };
+
     if (impl_->dtype() == DType::Float32) {
-        const float* src = static_cast<const float*>(srcData);
-        float* dst = static_cast<float*>(dstData);
-        for (size_t i = 0; i < numElements; ++i) {
-            dst[i] = src[i];
-        }
+        copy_loop(static_cast<float*>(dstData),
+                  static_cast<const float*>(srcData));
     } else if (impl_->dtype() == DType::Int32) {
-        const int32_t* src = static_cast<const int32_t*>(srcData);
-        int32_t* dst = static_cast<int32_t*>(dstData);
-        for (size_t i = 0; i < numElements; ++i) {
-            dst[i] = src[i];
-        }
+        copy_loop(static_cast<int32_t*>(dstData),
+                  static_cast<const int32_t*>(srcData));
     } else if (impl_->dtype() == DType::Int64) {
-        const int64_t* src = static_cast<const int64_t*>(srcData);
-        int64_t* dst = static_cast<int64_t*>(dstData);
-        for (size_t i = 0; i < numElements; ++i) {
-            dst[i] = src[i];
-        }
+        copy_loop(static_cast<int64_t*>(dstData),
+                  static_cast<const int64_t*>(srcData));
     }
-    
-    return Tensor(storage, impl_->shape(), impl_->dtype());
+
+    Tensor result(storage, shape, impl_->dtype());
+    if (requiredGrad()) {
+        auto fn = std::make_shared<CopyBackward>();
+        fn->inputs = {*this};
+        result.setGradFn(fn);
+        result.setRequiresGrad(true);
+    }
+    return result;
 }
 
-void Tensor::view(const vector<int64_t>& newShape){
-    auto sameStorage= impl_->storage();
-    //size_t sameOffset = impl_->offset();
-
+Tensor Tensor::view(const vector<int64_t>& newShape) const {
     size_t newNumElement = 1;
-    for(int64_t i : newShape) newNumElement *= i;
-    if (newNumElement != impl_->numel()){ 
-        throw runtime_error("Shape error: new shape should contian the same number of elements as before");
-   }
+    for (int64_t i : newShape) newNumElement *= i;
+    if (newNumElement != impl_->numel()) {
+        throw runtime_error("Shape error: new shape should contain the same number of elements as before");
+    }
 
-   impl_ = make_shared<TensorImpl>(sameStorage , newShape , impl_->dtype()); 
+    // Preserve the original offset but recompute row-major strides for the new
+    // shape so the view is valid for contiguous storage.
+    auto newImpl = std::make_shared<TensorImpl>(
+        impl_->storage(), newShape, impl_->dtype(), static_cast<int64_t>(impl_->offset()));
+    Tensor result(newImpl);
+
+    if (requiredGrad()) {
+        auto fn = std::make_shared<ViewBackward>();
+        fn->inputs = {*this};
+        fn->original_shape = impl_->shape();
+        result.setGradFn(fn);
+        result.setRequiresGrad(true);
+    }
+
+    return result;
 }
 
 Tensor Tensor::slice(int64_t start,int64_t finish,int64_t dimension){
@@ -421,7 +468,20 @@ Tensor Tensor::transpose_view(size_t d1, size_t d2) const {
     
     // Zero-copy transpose using custom strides
     auto newImpl = make_shared<TensorImpl>(impl_->storage(), newShape, newStrides, impl_->dtype(), impl_->offset());
-    return Tensor(newImpl);
+    Tensor result(newImpl);
+
+    // Propagate autograd: if the source requires a gradient, attach a
+    // TransposeBackward node so the gradient flows back through this view.
+    if (impl_->requires_grad()) {
+        result.impl_->set_requires_grad(true);
+        auto fn = make_shared<TransposeBackward>();
+        fn->inputs = {*this};
+        fn->d1 = d1;
+        fn->d2 = d2;
+        result.impl_->set_grad_fn(fn);
+    }
+
+    return result;
 }
 
 // Non-inplace versions (create new tensors and return them)
@@ -554,6 +614,8 @@ Tensor Tensor::log() const {
 }
 
 Tensor Tensor::matmul(const Tensor& other) const {
+    // tiled_matmul_2d now reads actual strides from each tensor so no
+    // contiguous copy is required before dispatching.
     std::optional<Tensor> result;
     switch (impl_->dtype()) {
         case DType::Float32:
@@ -724,19 +786,51 @@ void Tensor::backward_impl(const Tensor& passedDownGrad){
 
 template <typename T>
 Tensor Tensor::softmax(int64_t dim) {
-    Tensor out = clone();
-
-    auto shape = out.shape();
-    int64_t ndim = shape.size();
+    // We MUST allocate 'out' with its own TensorImpl (independent of *this).
+    // contiguous() returns *this when already contiguous (sharing impl_), so
+    // calling out.setGradFn() would also overwrite *this's gradFn and store
+    // *this in fn->inputs[0] creating a self-referential cycle that causes
+    // backward_impl to loop forever.
+    //
+    // Instead: copy the logical elements from *this into a fresh row-major tensor,
+    // run softmax in-place on that tensor, and attach SoftmaxBackward(inputs={*this})
+    // (which holds the unmodified pre-softmax logits).
+    const auto& sh = impl_->shape();
+    int64_t ndim = (int64_t)sh.size();
     if (dim < 0) dim += ndim;
     if (dim < 0 || dim >= ndim)
         throw std::runtime_error("Invalid softmax dim");
 
-    auto* data = static_cast<T*>(out.data());
+    // Allocate fresh row-major output.
+    Tensor out(sh, impl_->dtype(), impl_->storage()->device());
+    T* data = static_cast<T*>(out.data());
+    // out.strides() are the standard row-major strides for sh.
+    const auto& out_st = out.strides();
 
+    // Copy *this into out, element by element, using *this's strides for reading
+    // and out's (row-major) strides for writing.
+    {
+        const T*   src      = static_cast<const T*>(impl_->storage()->data());
+        const auto& src_st  = impl_->strides();
+        size_t     base_off = impl_->offset();
+        std::vector<int64_t> cidx(ndim, 0);
+        for (size_t flat = 0; flat < impl_->numel(); ++flat) {
+            // source element
+            size_t src_off = base_off;
+            for (int d = 0; d < ndim; ++d) src_off += cidx[d] * src_st[d];
+            // destination: row-major flat index (same multi-index, contiguous layout)
+            size_t dst_off = 0;
+            for (int d = 0; d < ndim; ++d) dst_off += cidx[d] * out_st[d];
+            data[dst_off] = src[src_off];
+            for (int d = ndim - 1; d >= 0; --d) {
+                if (++cidx[d] < sh[d]) break;
+                cidx[d] = 0;
+            }
+        }
+    }
 
-    int64_t dim_size = shape[dim];
-    int64_t outer_size = out.numel() / dim_size;
+    int64_t dim_size   = sh[dim];
+    int64_t outer_size = (int64_t)out.numel() / dim_size;
 
     // We iterate over all "outer" indices (all dims except `dim`)
     std::vector<int64_t> idx(ndim, 0);
@@ -747,54 +841,47 @@ Tensor Tensor::softmax(int64_t dim) {
         int64_t tmp = outer;
         for (int i = ndim - 1; i >= 0; --i) {
             if (i == dim) continue;
-            idx[i] = tmp % shape[i];
-            tmp /= shape[i];
+            idx[i] = tmp % sh[i];
+            tmp /= sh[i];
         }
 
-        // -----------------------------
-        // Step 1: find max (stability)
-        // -----------------------------
+        // Step 1: find max (numerical stability)
         T max_val = -std::numeric_limits<T>::infinity();
-
         for (int64_t i = 0; i < dim_size; ++i) {
             idx[dim] = i;
-
             int64_t offset = 0;
-            for (int d = 0; d < ndim; ++d)
-                offset += idx[d] * strides()[d];
-
+            for (int d = 0; d < ndim; ++d) offset += idx[d] * out_st[d];
             max_val = std::max(max_val, data[offset]);
         }
 
-        // -----------------------------
         // Step 2: exp + sum
-        // -----------------------------
         T sum = 0;
-
         for (int64_t i = 0; i < dim_size; ++i) {
             idx[dim] = i;
-
             int64_t offset = 0;
-            for (int d = 0; d < ndim; ++d)
-                offset += idx[d] * strides()[d];
-
+            for (int d = 0; d < ndim; ++d) offset += idx[d] * out_st[d];
             T val = std::exp(data[offset] - max_val);
             data[offset] = val;
             sum += val;
         }
 
-        // -----------------------------
         // Step 3: normalize
-        // -----------------------------
         for (int64_t i = 0; i < dim_size; ++i) {
             idx[dim] = i;
-
             int64_t offset = 0;
-            for (int d = 0; d < ndim; ++d)
-                offset += idx[d] * strides()[d];
-
+            for (int d = 0; d < ndim; ++d) offset += idx[d] * out_st[d];
             data[offset] /= sum;
         }
+    }
+
+    // Attach SoftmaxBackward.  inputs[0] = *this (pre-softmax logits, unchanged).
+    // out.impl_ is distinct from this->impl_, so this does NOT touch *this's gradFn.
+    if (requiredGrad()) {
+        auto fn = std::make_shared<SoftmaxBackward>();
+        fn->inputs = {*this};
+        fn->dim = dim;
+        out.impl_->set_grad_fn(fn);
+        out.impl_->set_requires_grad(true);
     }
 
     return out;

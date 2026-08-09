@@ -64,6 +64,11 @@ public:
     std::vector<Tensor> backward(const Tensor& pathDownGrad) override;
 };
 
+class CrossEntropyBatchedBackward : public GradFn {
+public:
+    std::vector<Tensor> backward(const Tensor& pathDownGrad) override;
+};
+
 class MSEBackward : public GradFn {
 public:
     std::vector<Tensor> backward(const Tensor& pathDownGrad) override;
@@ -71,6 +76,48 @@ public:
 
 class BCEBackward : public GradFn {
 public:
+    std::vector<Tensor> backward(const Tensor& pathDownGrad) override;
+};
+
+// Gradient for transpose_view: inputs[0] = original tensor before transpose.
+// Backward simply transposes the upstream gradient back with the same d1/d2.
+class TransposeBackward : public GradFn {
+public:
+    size_t d1 = 0, d2 = 1;
+    std::vector<Tensor> backward(const Tensor& pathDownGrad) override;
+};
+
+// Gradient for LayerNorm.
+// inputs[0] = original input x, inputs[1] = weight gamma, inputs[2] = bias beta.
+// eps is stored separately because it is not a Tensor.
+class LayerNormBackward : public GradFn {
+public:
+    float eps = 1e-5f;
+    std::vector<Tensor> backward(const Tensor& pathDownGrad) override;
+};
+
+// Gradient for view() / reshape(): inputs[0] = original tensor.
+// View is a zero-copy metadata change; backward just reshapes the upstream
+// gradient back to the original input shape.
+class ViewBackward : public GradFn {
+public:
+    std::vector<int64_t> original_shape;
+    std::vector<Tensor> backward(const Tensor& pathDownGrad) override;
+};
+
+// Gradient for contiguous() / clone(): inputs[0] = original tensor.
+// A copy is the identity w.r.t. its input; backward passes the upstream
+// gradient through unchanged.
+class CopyBackward : public GradFn {
+public:
+    std::vector<Tensor> backward(const Tensor& pathDownGrad) override;
+};
+
+// Gradient for softmax(x, dim): inputs[0] = original pre-softmax logits.
+// Backward recomputes s = softmax(x) then dx_i = s_i * (dy_i - sum_j(dy_j * s_j)).
+class SoftmaxBackward : public GradFn {
+public:
+    int64_t dim = -1;
     std::vector<Tensor> backward(const Tensor& pathDownGrad) override;
 };
 

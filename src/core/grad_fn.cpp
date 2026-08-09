@@ -11,27 +11,46 @@ static Tensor reduce_gradient(const Tensor& grad, const std::vector<int64_t>& in
     }
 
     Tensor result = grad;
-    int64_t grad_rank = grad.shape().size();
-    int64_t input_rank = input_shape.size();
+    int64_t grad_rank = (int64_t)grad.shape().size();
+    int64_t input_rank = (int64_t)input_shape.size();
 
-    // Work from right to left (right-aligned shapes)
-    // We need to track the current dimension index in result since sum reduces rank
-    int64_t current_dim = grad_rank - 1;
+    // Process dimensions from left (dim 0) to right.
+    // current_dim tracks the current position in the evolving result tensor.
+    // Summing at current_dim removes that dimension (rank shrinks by 1), so
+    // the next original dim maps to the same current_dim.
+    // Keeping a dimension advances current_dim by 1.
+    int64_t current_dim = 0;
 
     for (int64_t i = 0; i < grad_rank; ++i) {
-        int64_t grad_dim_idx = grad_rank - 1 - i;
-        int64_t input_dim_idx = input_rank - 1 - i;
+        // Right-aligned: what is the corresponding input dimension?
+        int64_t input_dim_idx = i - (grad_rank - input_rank);
 
         if (input_dim_idx < 0) {
-            // Input has fewer dimensions - this entire dim was added by broadcasting
-            // Sum over this dimension
+            // This grad dim does not exist in input (extra leading dim) → sum away
             result = result.sum(current_dim);
-            current_dim--;  // Since we reduced rank, decrement current_dim
-        } else if (input_shape[input_dim_idx] == 1 && grad.shape()[grad_dim_idx] > 1) {
-            // This dimension was broadcast (size 1 -> larger)
-            // Sum over this dimension
-            result = result.sum(current_dim);
-            current_dim--;  // Since we reduced rank, decrement current_dim
+            // Don't advance current_dim; next original dim maps to the same slot
+        } else if (input_shape[input_dim_idx] == 1 && result.shape()[current_dim] > 1) {
+            // Input had size 1 at this dim (was broadcast to a larger size) → sum away
+            if (result.shape().size() == 1) {
+                // Total reduction that would otherwise become a 0-dim (unsupported)
+                // scalar tensor; keep it as a 1-element 1-D tensor instead.
+                Tensor result_1({1}, result.dtype(), result.device());
+                float total = 0.0f;
+                for (size_t j = 0; j < result.numel(); ++j)
+                    total += result.at<float>(j);
+                result_1.at<float>(0) = total;
+                result = result_1;
+            } else {
+                result = result.sum(current_dim);
+                // Re-insert the size-1 dimension so the shape matches input_shape
+                auto sh = result.shape();
+                sh.insert(sh.begin() + current_dim, 1LL);
+                result = result.view(sh);
+            }
+            current_dim++;
+        } else {
+            // Dimensions match → advance to the next slot
+            current_dim++;
         }
     }
 
@@ -225,6 +244,56 @@ std::vector<Tensor> CrossEntropyWithProbsBackward::backward(const Tensor& pathDo
     return {grad};
 }
 
+std::vector<Tensor> CrossEntropyBatchedBackward::backward(const Tensor& pathDownGrad) {
+    const Tensor& logits = inputs[0];
+    const Tensor& targets = inputs[1];
+
+    auto logShape = logits.shape();
+    int64_t B = logShape[0];
+    int64_t T = logShape[1];
+    int64_t V = logShape[2];
+    int64_t N = B * T;
+
+    float upstream = (pathDownGrad.numel() == 1) ? pathDownGrad.at<float>(0) : 1.0f;
+    float scale = upstream / static_cast<float>(N);
+
+    const float* logits_ptr = static_cast<const float*>(logits.data());
+    const int64_t* targets_ptr = static_cast<const int64_t*>(targets.data());
+    const std::vector<int64_t>& ls = logits.strides();
+    const std::vector<int64_t>& ts = targets.strides();
+
+    Tensor grad(logits.shape(), logits.dtype(), logits.device());
+    float* grad_ptr = static_cast<float*>(grad.data());
+    const std::vector<int64_t>& gs = grad.strides();
+
+    for (int64_t b = 0; b < B; ++b) {
+        for (int64_t t = 0; t < T; ++t) {
+            const float* row = logits_ptr + b * ls[0] + t * ls[1];
+            float* grad_row = grad_ptr + b * gs[0] + t * gs[1];
+            int64_t target_class = targets_ptr[b * ts[0] + t * ts[1]];
+
+            float max_logit = row[0];
+            for (int64_t v = 1; v < V; ++v) {
+                max_logit = std::max(max_logit, row[v * ls[2]]);
+            }
+
+            float sum_exp = 0.0f;
+            for (int64_t v = 0; v < V; ++v) {
+                sum_exp += std::exp(row[v * ls[2]] - max_logit);
+            }
+
+            for (int64_t v = 0; v < V; ++v) {
+                float softmax_val = std::exp(row[v * ls[2]] - max_logit) / sum_exp;
+                float one_hot = (v == target_class) ? 1.0f : 0.0f;
+                grad_row[v * gs[2]] = (softmax_val - one_hot) * scale;
+            }
+        }
+    }
+
+    grad.setRequiresGrad(false);
+    return {grad};
+}
+
 std::vector<Tensor> MSEBackward::backward(const Tensor& pathDownGrad) {
     // MSE gradient: 2 * (predictions - targets) / n
     // inputs[0] = predictions, inputs[1] = targets
@@ -269,6 +338,185 @@ std::vector<Tensor> BCEBackward::backward(const Tensor& pathDownGrad) {
 
     grad.setRequiresGrad(false);
     return {grad};
+}
+
+std::vector<Tensor> TransposeBackward::backward(const Tensor& pathDownGrad) {
+    // inputs[0] = original tensor (before the transpose).
+    // Swapping d1,d2 is its own inverse, so we just transpose back.
+    Tensor grad = pathDownGrad.transpose_view(d1, d2).contiguous();
+    grad.setRequiresGrad(false);
+    return {grad};
+}
+
+std::vector<Tensor> LayerNormBackward::backward(const Tensor& pathDownGrad) {
+    // inputs[0] = input x   [... , D]
+    // inputs[1] = weight γ  [D]
+    // inputs[2] = bias β    [D]   (not needed for math but keeps the inputs[] index consistent)
+    const Tensor& x     = inputs[0];
+    const Tensor& gamma = inputs[1];
+
+    const auto& x_shape = x.shape();
+    const int64_t D     = x_shape.back();
+    const int64_t batch = static_cast<int64_t>(x.numel()) / D;
+    const float   N     = static_cast<float>(D);
+
+    Tensor d_x    (x_shape,      x.dtype(),     x.device());
+    Tensor d_gamma({D},          gamma.dtype(), gamma.device());
+    Tensor d_beta ({D},          gamma.dtype(), gamma.device());
+
+    d_gamma.fill_<float>(0.0f);
+    d_beta .fill_<float>(0.0f);
+
+    const float* x_data  = static_cast<const float*>(x.data());
+    const float* g_data  = static_cast<const float*>(gamma.data());
+    const float* dy_data = static_cast<const float*>(pathDownGrad.data());
+    float*       dx_data = static_cast<float*>(d_x.data());
+    float*       dg_data = static_cast<float*>(d_gamma.data());
+    float*       db_data = static_cast<float*>(d_beta.data());
+
+    // Allocate x_hat once outside the loop to avoid per-row heap allocations.
+    std::vector<float> x_hat(D);
+
+    for (int64_t b = 0; b < batch; ++b) {
+        const float* xr  = x_data  + b * D;
+        const float* dyr = dy_data + b * D;
+        float*       dxr = dx_data + b * D;
+
+        // mean and variance of this row
+        float mean = 0.0f;
+        for (int64_t j = 0; j < D; ++j) mean += xr[j];
+        mean /= N;
+
+        float var = 0.0f;
+        for (int64_t j = 0; j < D; ++j) {
+            float d = xr[j] - mean;
+            var += d * d;
+        }
+        var /= N;
+        const float std_val = std::sqrt(var + eps);
+
+        // normalised input for this row (reuses the pre-allocated buffer)
+        for (int64_t j = 0; j < D; ++j)
+            x_hat[j] = (xr[j] - mean) / std_val;
+
+        // accumulate d_gamma = dy * x_hat,  d_beta = dy
+        for (int64_t j = 0; j < D; ++j) {
+            dg_data[j] += dyr[j] * x_hat[j];
+            db_data[j] += dyr[j];
+        }
+
+        // mean(γ·dy) and mean(γ·dy·x̂) across the normalised dimension
+        float mean_g_dy      = 0.0f;
+        float mean_g_dy_xhat = 0.0f;
+        for (int64_t j = 0; j < D; ++j) {
+            float g_dy = g_data[j] * dyr[j];
+            mean_g_dy      += g_dy;
+            mean_g_dy_xhat += g_dy * x_hat[j];
+        }
+        mean_g_dy      /= N;
+        mean_g_dy_xhat /= N;
+
+        // d_x_i = (1/σ) · (γ_i·dy_i  −  mean(γ·dy)  −  x̂_i·mean(γ·dy·x̂))
+        for (int64_t j = 0; j < D; ++j) {
+            dxr[j] = (g_data[j] * dyr[j] - mean_g_dy - x_hat[j] * mean_g_dy_xhat)
+                     / std_val;
+        }
+    }
+
+    d_x   .setRequiresGrad(false);
+    d_gamma.setRequiresGrad(false);
+    d_beta .setRequiresGrad(false);
+    return {d_x, d_gamma, d_beta};
+}
+
+std::vector<Tensor> ViewBackward::backward(const Tensor& pathDownGrad) {
+    // Reshape the upstream gradient back to the original input shape.
+    // View is metadata-only, so the data order is unchanged.
+    Tensor grad = pathDownGrad.view(original_shape);
+    grad.setRequiresGrad(false);
+    return {grad};
+}
+
+std::vector<Tensor> CopyBackward::backward(const Tensor& pathDownGrad) {
+    // Contiguous()/clone() is a copy in the forward; backward passes the
+    // upstream gradient through unchanged (shape already matches input).
+    Tensor grad = pathDownGrad;
+    grad.setRequiresGrad(false);
+    return {grad};
+}
+
+std::vector<Tensor> SoftmaxBackward::backward(const Tensor& pathDownGrad) {
+    // inputs[0] = original pre-softmax logits x
+    // dx_i = s_i * (dy_i - sum_j (dy_j * s_j))  where s = softmax(x)
+    const Tensor& x = inputs[0];
+    const auto shape = x.shape();
+    const int64_t ndim = static_cast<int64_t>(shape.size());
+    int64_t d = dim;
+    if (d < 0) d += ndim;
+    if (d < 0 || d >= ndim) throw std::runtime_error("Invalid softmax dim in backward");
+
+    const int64_t dim_size = shape[d];
+    const int64_t outer_size = static_cast<int64_t>(x.numel()) / dim_size;
+
+    Tensor dx(shape, x.dtype(), x.device());
+    dx.setRequiresGrad(false);
+
+    std::vector<int64_t> idx(ndim, 0);
+
+    for (int64_t outer = 0; outer < outer_size; ++outer) {
+        // decode outer index to multidimensional index (except dim)
+        int64_t tmp = outer;
+        for (int i = ndim - 1; i >= 0; --i) {
+            if (i == d) continue;
+            idx[i] = tmp % shape[i];
+            tmp /= shape[i];
+        }
+
+        // Step 1: max for numerical stability
+        float max_val = -std::numeric_limits<float>::infinity();
+        for (int64_t i = 0; i < dim_size; ++i) {
+            idx[d] = i;
+            int64_t offset = 0;
+            for (int dim = 0; dim < ndim; ++dim) offset += idx[dim] * x.strides()[dim];
+            max_val = std::max(max_val, x.at<float>(offset));
+        }
+
+        // Step 2: compute softmax s_i and store
+        float sum = 0.0f;
+        std::vector<float> s(dim_size);
+        for (int64_t i = 0; i < dim_size; ++i) {
+            idx[d] = i;
+            int64_t offset = 0;
+            for (int dim = 0; dim < ndim; ++dim) offset += idx[dim] * x.strides()[dim];
+            float v = std::exp(x.at<float>(offset) - max_val);
+            s[i] = v;
+            sum += v;
+        }
+        for (float& v : s) v /= sum;
+
+        // Step 3: dot = sum_j (dy_j * s_j)
+        float dot = 0.0f;
+        for (int64_t i = 0; i < dim_size; ++i) {
+            idx[d] = i;
+            int64_t offset = 0;
+            for (int dim = 0; dim < ndim; ++dim) offset += idx[dim] * pathDownGrad.strides()[dim];
+            dot += pathDownGrad.at<float>(offset) * s[i];
+        }
+
+        // Step 4: dx_i = s_i * (dy_i - dot)
+        for (int64_t i = 0; i < dim_size; ++i) {
+            idx[d] = i;
+            int64_t grad_offset = 0;
+            int64_t out_offset = 0;
+            for (int dim = 0; dim < ndim; ++dim) {
+                grad_offset += idx[dim] * pathDownGrad.strides()[dim];
+                out_offset += idx[dim] * dx.strides()[dim];
+            }
+            dx.at<float>(out_offset) = s[i] * (pathDownGrad.at<float>(grad_offset) - dot);
+        }
+    }
+
+    return {dx};
 }
 
 std::vector<Tensor> L1Backward::backward(const Tensor& pathDownGrad) {

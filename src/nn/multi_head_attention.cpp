@@ -22,20 +22,21 @@ Tensor MultiHeadAttention::forward(const Tensor& input) {
     Tensor V = vProj_->forward(input);
     int64_t headDim = embedDim_ / numHeads_;
 
-    Q.view({input.shape()[0], input.shape()[1], numHeads_, headDim});
-    K.view({input.shape()[0], input.shape()[1], numHeads_, headDim});
-    V.view({input.shape()[0], input.shape()[1], numHeads_, headDim});
+    // Reshape to [batch, seq, heads, headDim] and then swap heads/seq so the
+    // attention acts on [batch, heads, seq, headDim].
+    Q = Q.view({input.shape()[0], input.shape()[1], numHeads_, headDim})
+          .transpose_view(1, 2);
+    K = K.view({input.shape()[0], input.shape()[1], numHeads_, headDim})
+          .transpose_view(1, 2);
+    V = V.view({input.shape()[0], input.shape()[1], numHeads_, headDim})
+          .transpose_view(1, 2);
 
-    Q.transpose(1, 2);
-    K.transpose(1, 2);
-    V.transpose(1, 2);
+    Tensor sftmax = attention_->forward(Q, K, V);
+    // Swap back to [batch, seq, heads, headDim], make row-major, then flatten.
+    sftmax = sftmax.transpose_view(1, 2).contiguous()
+                   .view({input.shape()[0], input.shape()[1], embedDim_});
 
-    Tensor sftmax = attention_->forward(Q,K,V);
-    sftmax.transpose(1, 2);
-    sftmax = sftmax.contiguous();
-    sftmax.view({input.shape()[0], input.shape()[1], embedDim_});
-    
-    return (outProj_->forward(sftmax));
+    return outProj_->forward(sftmax);
 }
 
 std::vector<Tensor> MultiHeadAttention::parameters() {

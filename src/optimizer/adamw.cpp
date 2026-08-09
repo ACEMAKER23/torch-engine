@@ -18,63 +18,39 @@ adamw::adamw(const std::vector<Tensor>& parameters, float beta1, float beta2, fl
 
 void adamw::step(float learningRate) {
     step_++;
-    
-    // Create scalar tensors for hyperparameters
-    Tensor beta1_tensor({1}, DType::Float32, Device::CPU);
-    beta1_tensor.at<float>(0) = beta1_;
-    
-    Tensor beta2_tensor({1}, DType::Float32, Device::CPU);
-    beta2_tensor.at<float>(0) = beta2_;
-    
-    Tensor one_tensor({1}, DType::Float32, Device::CPU);
-    one_tensor.at<float>(0) = 1.0f;
-    
-    Tensor lr_tensor({1}, DType::Float32, Device::CPU);
-    lr_tensor.at<float>(0) = learningRate;
-    
-    Tensor epsilon_tensor({1}, DType::Float32, Device::CPU);
-    epsilon_tensor.at<float>(0) = epsilon_;
-    
-    Tensor wd_tensor({1}, DType::Float32, Device::CPU);
-    wd_tensor.at<float>(0) = weight_decay_;
-    
-    // Bias correction factors
-    float bias_correction1 = 1.0f - std::pow(beta1_, step_);
-    float bias_correction2 = 1.0f - std::pow(beta2_, step_);
-    
-    Tensor bc1_tensor({1}, DType::Float32, Device::CPU);
-    bc1_tensor.at<float>(0) = bias_correction1;
-    
-    Tensor bc2_tensor({1}, DType::Float32, Device::CPU);
-    bc2_tensor.at<float>(0) = bias_correction2;
-    
+
+    float bc1 = 1.0f - std::pow(beta1_, step_);
+    float bc2 = 1.0f - std::pow(beta2_, step_);
+
     for (size_t i = 0; i < processing_.size(); ++i) {
         Tensor& param = processing_[i];
-        Tensor& m = m_[i];
-        Tensor& v = v_[i];
-        
-        if (param.requiredGrad() && param.grad()) {
-            Tensor grad = *param.grad();
-            
-            // Apply weight decay directly to parameter (decoupled from gradient)
-            param = param - (param * wd_tensor);
-            
-            // Update m: m = beta1 * m + (1 - beta1) * grad
-            m = (m * beta1_tensor) + (grad * (one_tensor - beta1_tensor));
-            
-            // Update v: v = beta2 * v + (1 - beta2) * grad^2
-            Tensor grad_squared = grad * grad;
-            v = (v * beta2_tensor) + (grad_squared * (one_tensor - beta2_tensor));
-            
-            // Bias correction
-            Tensor m_hat = m / bc1_tensor;
-            Tensor v_hat = v / bc2_tensor;
-            
-            // Update parameter: param = param - lr * m_hat / (sqrt(v_hat) + epsilon)
-            Tensor sqrt_v_hat = v_hat.sqrt();
-            Tensor denominator = sqrt_v_hat + epsilon_tensor;
-            Tensor update = m_hat / denominator;
-            param = param - (update * lr_tensor);
+        Tensor& m     = m_[i];
+        Tensor& v     = v_[i];
+
+        if (!param.requiredGrad() || !param.grad()) continue;
+
+        size_t N = param.numel();
+        auto*       p_data = static_cast<float*>(param.data());
+        auto*       m_data = static_cast<float*>(m.data());
+        auto*       v_data = static_cast<float*>(v.data());
+        const auto* g_data = static_cast<const float*>(param.grad()->data());
+
+        for (size_t j = 0; j < N; ++j) {
+            float g = g_data[j];
+
+            // Decoupled weight decay
+            p_data[j] *= (1.0f - weight_decay_);
+
+            // First and second moment estimates
+            m_data[j] = beta1_ * m_data[j] + (1.0f - beta1_) * g;
+            v_data[j] = beta2_ * v_data[j] + (1.0f - beta2_) * g * g;
+
+            // Bias-corrected moments
+            float m_hat = m_data[j] / bc1;
+            float v_hat = v_data[j] / bc2;
+
+            // In-place parameter update (updates model weights directly)
+            p_data[j] -= learningRate * m_hat / (std::sqrt(v_hat) + epsilon_);
         }
     }
 }
