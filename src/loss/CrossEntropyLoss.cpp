@@ -78,7 +78,8 @@ Tensor crossEntropyLoss::forward_batched(const Tensor& predictions, const Tensor
             static_cast<float*>(loss.data()),
             static_cast<int>(B), static_cast<int>(T), static_cast<int>(V));
         cuda_check_error(cudaGetLastError(), "cuda_crossentropy_batched_forward failed");
-        cuda_check_error(cudaDeviceSynchronize(), "cudaDeviceSynchronize after crossentropy forward");
+        // No explicit sync: cudaMemcpy(DeviceToHost) is inherently synchronous
+        // and waits for all preceding GPU work on the default stream.
 
         float loss_h = 0.0f;
         cuda_check_error(

@@ -96,7 +96,7 @@ public:
     std::vector<Tensor> backward(const Tensor& pathDownGrad) override;
 };
 
-// Gradient for view() / reshape(): inputs[0] = original tensor.
+// Gradient for view(): inputs[0] = original tensor.
 // View is a zero-copy metadata change; backward just reshapes the upstream
 // gradient back to the original input shape.
 class ViewBackward : public GradFn {
@@ -110,6 +110,18 @@ public:
 // gradient through unchanged.
 class CopyBackward : public GradFn {
 public:
+    std::vector<Tensor> backward(const Tensor& pathDownGrad) override;
+};
+
+// Gradient for reshape(): inputs[0] = original (possibly non-contiguous) tensor.
+// When the input is already contiguous, reshape() degrades to view() and this
+// node is never created.  When a copy was required (non-contiguous input),
+// backward reshapes the upstream gradient back to the original shape.
+// Gradients flowing back through the network are always contiguous (CUDA
+// kernels write row-major output), so view() inside backward is free.
+class ReshapeBackward : public GradFn {
+public:
+    std::vector<int64_t> original_shape;
     std::vector<Tensor> backward(const Tensor& pathDownGrad) override;
 };
 

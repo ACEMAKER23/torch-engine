@@ -23,6 +23,21 @@ void cuda_sum_dim(const float* input, float* output,
                   const int64_t* in_shape, const int64_t* in_strides,
                   const int64_t* out_shape, const int64_t* out_strides,
                   int64_t dim, int64_t ndim, int64_t out_numel, int64_t dim_size);
+void cuda_negate_f32(const float* src, float* dst, int64_t size);
+void cuda_adamw_f32(float* params, const float* grads,
+                    float* m, float* v,
+                    float lr, float beta1, float beta2,
+                    float epsilon, float weight_decay,
+                    int64_t step, int64_t size);
+void cuda_gather_strided_f32(const float*   src, float*   dst,
+                              const int64_t* shape_h, const int64_t* strides_h,
+                              int64_t ndim, int64_t src_offset, int64_t numel);
+void cuda_gather_strided_i32(const int32_t* src, int32_t* dst,
+                              const int64_t* shape_h, const int64_t* strides_h,
+                              int64_t ndim, int64_t src_offset, int64_t numel);
+void cuda_gather_strided_i64(const int64_t* src, int64_t* dst,
+                              const int64_t* shape_h, const int64_t* strides_h,
+                              int64_t ndim, int64_t src_offset, int64_t numel);
 #endif
 
 // Forward declarations for low-precision types (defined in dtype_utils.h)
@@ -90,6 +105,10 @@ public:
     Tensor contiguous() const;
 
     Tensor view(const vector<int64_t>& newShape) const;
+    // reshape() is like view() but handles non-contiguous tensors: it makes
+    // a contiguous copy if needed, then returns a zero-copy metadata view.
+    // Creates a single ReshapeBackward node (vs CopyBackward+ViewBackward).
+    Tensor reshape(const std::vector<int64_t>& new_shape) const;
     void transpose();
     void transpose(size_t d1, size_t d2);
     Tensor transpose_view(size_t d1, size_t d2) const;
@@ -322,27 +341,27 @@ public:
         return data[flatIndex + impl_->offset()];
     }
 
+    // Return the full sum as a 1-element Tensor on the same device.
+    // This keeps the scalar on the GPU so callers that need a device-resident
+    // scalar (e.g. gradient accumulation) avoid a D2H→H2D round trip.
+    Tensor sum_to_scalar() const;
+
     template<typename T>
     T sum() {
         if constexpr (std::is_same_v<T, float>) {
+            Tensor scalar = sum_to_scalar();
             if (device() == Device::CUDA) {
 #ifdef USE_CUDA
-                Tensor d_scalar({1}, dtype(), Device::CUDA);
-                cuda_fill(static_cast<float*>(d_scalar.data()), 0.0f, 1);
-                cuda_reduce_sum(static_cast<const float*>(data()),
-                                static_cast<float*>(d_scalar.data()),
-                                static_cast<int64_t>(numel()));
-                cuda_check_error(cudaGetLastError(), "cuda_reduce_sum failed");
-                cuda_check_error(cudaDeviceSynchronize(), "cudaDeviceSynchronize after reduce_sum");
                 float h_scalar = 0.0f;
                 cuda_check_error(
-                    cudaMemcpy(&h_scalar, d_scalar.data(), sizeof(float), cudaMemcpyDeviceToHost),
-                    "cudaMemcpy reduce_sum D2H");
+                    cudaMemcpy(&h_scalar, scalar.data(), sizeof(float), cudaMemcpyDeviceToHost),
+                    "cudaMemcpy sum_to_scalar D2H");
                 return h_scalar;
 #else
                 throw std::runtime_error("CUDA not available");
 #endif
             }
+            return scalar.at<float>(0);
         }
         T result = 0;
         for (size_t i = 0; i < numel(); ++i) {
@@ -473,10 +492,19 @@ public:
 
     template<typename T>
     void fill_(T value) {
-        auto* data = static_cast<T*>(impl_->storage()->data());
+#ifdef USE_CUDA
+        if constexpr (std::is_same_v<T, float>) {
+            if (device() == Device::CUDA) {
+                cuda_fill(static_cast<float*>(data()), static_cast<float>(value),
+                          static_cast<int64_t>(numel()));
+                return;
+            }
+        }
+#endif
+        auto* raw = static_cast<T*>(impl_->storage()->data());
         for (size_t i = 0; i < numel(); i++) {
             size_t idx = impl_->offset() + i;
-            data[idx] = value;
+            raw[idx] = value;
         }
     }
 
@@ -642,22 +670,88 @@ public:
             size_t num_batches = 1;
             for (int64_t dim : batch_shape) num_batches *= dim;
 
-            std::vector<int64_t> batch_indices_multi(batch_shape.size());
-            for (size_t batch_idx = 0; batch_idx < num_batches; ++batch_idx) {
-                size_t temp_idx = batch_idx;
+            // Try to use cublasSgemmStridedBatched when the batch matrices are
+            // uniformly strided in memory.  This is true for contiguous
+            // non-broadcasted batches, and also for simple broadcasting where
+            // an operand is repeated with stride 1.  Fall back to the per-batch
+            // loop when the stride pattern is not uniform.
+            auto flat_batch_indices = [&](size_t flat) {
+                std::vector<int64_t> indices(batch_shape.size());
+                size_t temp = flat;
                 for (int i = (int)batch_shape.size() - 1; i >= 0; --i) {
-                    batch_indices_multi[i] = temp_idx % batch_shape[i];
-                    temp_idx /= batch_shape[i];
+                    indices[i] = temp % batch_shape[i];
+                    temp /= batch_shape[i];
                 }
+                return indices;
+            };
 
-                size_t offset_a = compute_batch_offset(a, batch_indices_multi);
-                size_t offset_b = compute_batch_offset(b, batch_indices_multi);
-                size_t offset_result = compute_batch_offset(result, batch_indices_multi);
+            bool use_strided_batched = false;
+            long long stride_a = 0, stride_b = 0, stride_c = 0;
+            size_t offset_a0 = 0, offset_b0 = 0, offset_c0 = 0;
 
-                do_gemm(A_ptr + offset_a, B_ptr + offset_b, C_ptr + offset_result);
+            if (num_batches >= 2) {
+                auto i0 = flat_batch_indices(0);
+                auto i1 = flat_batch_indices(1);
+                offset_a0 = compute_batch_offset(a, i0);
+                offset_b0 = compute_batch_offset(b, i0);
+                offset_c0 = compute_batch_offset(result, i0);
+                size_t offset_a1 = compute_batch_offset(a, i1);
+                size_t offset_b1 = compute_batch_offset(b, i1);
+                size_t offset_c1 = compute_batch_offset(result, i1);
+                stride_a = static_cast<long long>(offset_a1) - static_cast<long long>(offset_a0);
+                stride_b = static_cast<long long>(offset_b1) - static_cast<long long>(offset_b0);
+                stride_c = static_cast<long long>(offset_c1) - static_cast<long long>(offset_c0);
+
+                use_strided_batched = true;
+                if (num_batches >= 3) {
+                    auto i2 = flat_batch_indices(2);
+                    size_t offset_a2 = compute_batch_offset(a, i2);
+                    size_t offset_b2 = compute_batch_offset(b, i2);
+                    size_t offset_c2 = compute_batch_offset(result, i2);
+                    long long stride_a2 = static_cast<long long>(offset_a2) - static_cast<long long>(offset_a1);
+                    long long stride_b2 = static_cast<long long>(offset_b2) - static_cast<long long>(offset_b1);
+                    long long stride_c2 = static_cast<long long>(offset_c2) - static_cast<long long>(offset_c1);
+                    if (stride_a2 != stride_a || stride_b2 != stride_b || stride_c2 != stride_c) {
+                        use_strided_batched = false;
+                    }
+                }
+            }
+
+            if (use_strided_batched) {
+                cublas_check_error(
+                    cublasSgemmStridedBatched(handle,
+                                              transA, transB,
+                                              static_cast<int>(N), static_cast<int>(M), static_cast<int>(K),
+                                              &alpha,
+                                              B_ptr + offset_b0, lda, stride_b,
+                                              A_ptr + offset_a0, ldb, stride_a,
+                                              &beta,
+                                              C_ptr + offset_c0, static_cast<int>(N), stride_c,
+                                              static_cast<int>(num_batches)),
+                    "cublasSgemmStridedBatched");
+            } else {
+                std::vector<int64_t> batch_indices_multi(batch_shape.size());
+                for (size_t batch_idx = 0; batch_idx < num_batches; ++batch_idx) {
+                    size_t temp_idx = batch_idx;
+                    for (int i = (int)batch_shape.size() - 1; i >= 0; --i) {
+                        batch_indices_multi[i] = temp_idx % batch_shape[i];
+                        temp_idx /= batch_shape[i];
+                    }
+
+                    size_t offset_a = compute_batch_offset(a, batch_indices_multi);
+                    size_t offset_b = compute_batch_offset(b, batch_indices_multi);
+                    size_t offset_result = compute_batch_offset(result, batch_indices_multi);
+
+                    do_gemm(A_ptr + offset_a, B_ptr + offset_b, C_ptr + offset_result);
+                }
             }
         }
-        cuda_check_error(cudaDeviceSynchronize(), "cudaDeviceSynchronize after cublasSgemm");
+        // NOTE: we intentionally do NOT synchronize here.  cublasSgemm is
+        // asynchronous on the default stream; subsequent CUDA work on the same
+        // stream is ordered correctly, and callers can synchronize when they
+        // actually need the result.  Removing this per-call sync lets the CPU
+        // enqueue many matmuls without stalling, which dramatically improves
+        // the backward pass.
 #else
         (void)a; (void)b; (void)result; (void)M; (void)K; (void)N; (void)batch_shape;
         throw std::runtime_error("CUDA not built into this binary");
@@ -781,6 +875,11 @@ public:
 
     //user faced backward function used for loss.backward()
     void backward();
+
+    // Profiling helpers for per-GradFn backward timing.
+    static void enable_grad_profile(bool enable);
+    static void reset_grad_profile();
+    static void print_grad_profile();
 
 
 private:

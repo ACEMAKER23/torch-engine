@@ -32,9 +32,11 @@ Tensor MultiHeadAttention::forward(const Tensor& input) {
           .transpose_view(1, 2);
 
     Tensor sftmax = attention_->forward(Q, K, V);
-    // Swap back to [batch, seq, heads, headDim], make row-major, then flatten.
-    sftmax = sftmax.transpose_view(1, 2).contiguous()
-                   .view({input.shape()[0], input.shape()[1], embedDim_});
+    // Swap back to [batch, seq, heads, headDim] and flatten to [batch, seq, E].
+    // reshape() handles the non-contiguous transpose_view with a single
+    // ReshapeBackward node (vs CopyBackward + ViewBackward from contiguous().view()).
+    sftmax = sftmax.transpose_view(1, 2)
+                   .reshape({input.shape()[0], input.shape()[1], embedDim_});
 
     return outProj_->forward(sftmax);
 }
@@ -59,4 +61,11 @@ void MultiHeadAttention::zero_grad() {
     kProj_->zero_grad();
     vProj_->zero_grad();
     outProj_->zero_grad();
+}
+
+void MultiHeadAttention::to_cuda() {
+    qProj_->to_cuda();
+    kProj_->to_cuda();
+    vProj_->to_cuda();
+    outProj_->to_cuda();
 }

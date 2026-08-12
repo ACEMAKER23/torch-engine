@@ -37,14 +37,9 @@ static Tensor reduce_gradient(const Tensor& grad, const std::vector<int64_t>& in
         } else if (input_shape[input_dim_idx] == 1 && result.shape()[current_dim] > 1) {
             // Input had size 1 at this dim (was broadcast to a larger size) → sum away
             if (result.shape().size() == 1) {
-                // Total reduction that would otherwise become a 0-dim (unsupported)
-                // scalar tensor; keep it as a 1-element 1-D tensor instead.
-                Tensor result_1({1}, result.dtype(), result.device());
-                float total = 0.0f;
-                for (size_t j = 0; j < result.numel(); ++j)
-                    total += result.at<float>(j);
-                result_1.at<float>(0) = total;
-                result = result_1;
+                // Last dimension: sum to a 1-element tensor already on the correct
+                // device, avoiding D2H→H2D round trips.
+                result = result.sum_to_scalar();
             } else {
                 result = result.sum(current_dim);
                 // Re-insert the size-1 dimension so the shape matches input_shape
@@ -129,8 +124,12 @@ std::vector<Tensor> MulBackward::backward(const Tensor& pathDownGrad) {
 }
 
 std::vector<Tensor> MatMulBackward::backward(const Tensor& pathDownGrad) {
-    auto grad_a = reduce_gradient(pathDownGrad.matmul(inputs[1].transpose_view(inputs[1].shape().size()-2,inputs[1].shape().size()-1)), inputs[0].shape());
-    auto grad_b = reduce_gradient(inputs[0].transpose_view(inputs[0].shape().size()-2,inputs[0].shape().size()-1).matmul(pathDownGrad), inputs[1].shape());
+    auto grad_a_raw = pathDownGrad.matmul(inputs[1].transpose_view(inputs[1].shape().size()-2,inputs[1].shape().size()-1));
+    Tensor grad_a = (grad_a_raw.shape() == inputs[0].shape()) ? grad_a_raw
+                                                              : reduce_gradient(grad_a_raw, inputs[0].shape());
+    auto grad_b_raw = inputs[0].transpose_view(inputs[0].shape().size()-2,inputs[0].shape().size()-1).matmul(pathDownGrad);
+    Tensor grad_b = (grad_b_raw.shape() == inputs[1].shape()) ? grad_b_raw
+                                                              : reduce_gradient(grad_b_raw, inputs[1].shape());
     grad_a.setRequiresGrad(false);
     grad_b.setRequiresGrad(false);
     std::vector<Tensor> result;
@@ -142,8 +141,12 @@ std::vector<Tensor> MatMulBackward::backward(const Tensor& pathDownGrad) {
 
 std::vector<Tensor> DivBackward::backward(const Tensor& pathDownGrad) {
     // For c = a/b: dc/da = 1/b, dc/db = -a/b^2
-    auto grad_a = reduce_gradient(pathDownGrad / inputs[1], inputs[0].shape());
-    auto grad_b = reduce_gradient(-pathDownGrad * inputs[0] / (inputs[1] * inputs[1]), inputs[1].shape());
+    auto grad_a_raw = pathDownGrad / inputs[1];
+    Tensor grad_a = (grad_a_raw.shape() == inputs[0].shape()) ? grad_a_raw
+                                                               : reduce_gradient(grad_a_raw, inputs[0].shape());
+    auto grad_b_raw = -pathDownGrad * inputs[0] / (inputs[1] * inputs[1]);
+    Tensor grad_b = (grad_b_raw.shape() == inputs[1].shape()) ? grad_b_raw
+                                                               : reduce_gradient(grad_b_raw, inputs[1].shape());
     grad_a.setRequiresGrad(false);
     grad_b.setRequiresGrad(false);
     std::vector<Tensor> result;
@@ -176,7 +179,7 @@ std::vector<Tensor> GeluBackward::backward(const Tensor& pathDownGrad) {
                            static_cast<float*>(grad.data()),
                            static_cast<int64_t>(input.numel()));
         cuda_check_error(cudaGetLastError(), "cuda_gelu_backward failed");
-        cuda_check_error(cudaDeviceSynchronize(), "cudaDeviceSynchronize after gelu backward");
+        // No sync: result stays on GPU; next kernel serialized on default stream.
 #else
         throw std::runtime_error("CUDA not available");
 #endif
@@ -304,7 +307,7 @@ std::vector<Tensor> CrossEntropyBatchedBackward::backward(const Tensor& pathDown
             scale,
             static_cast<int>(B), static_cast<int>(T), static_cast<int>(V));
         cuda_check_error(cudaGetLastError(), "cuda_crossentropy_batched_backward failed");
-        cuda_check_error(cudaDeviceSynchronize(), "cudaDeviceSynchronize after crossentropy backward");
+        // No sync: result stays on GPU; next kernel serialized on default stream.
 #else
         throw std::runtime_error("CUDA not available");
 #endif
@@ -436,18 +439,30 @@ std::vector<Tensor> LayerNormBackward::backward(const Tensor& pathDownGrad) {
                                 static_cast<int>(D),
                                 eps);
         cuda_check_error(cudaGetLastError(), "cuda_layernorm_backward failed");
-        cuda_check_error(cudaDeviceSynchronize(), "cudaDeviceSynchronize after layernorm backward");
+        // No sync: cudaMemcpy(D2D) below is on the same default stream and is
+        // serialized; cudaMemcpy(D2H) is inherently synchronous and waits for
+        // all preceding GPU work on the default stream.
 
-        Tensor d_gamma({D}, gamma.dtype(), Device::CPU);
-        Tensor d_beta ({D}, gamma.dtype(), Device::CPU);
-        cuda_check_error(
-            cudaMemcpy(d_gamma.data(), d_gamma_gpu.data(), D * sizeof(float), cudaMemcpyDeviceToHost),
-            "cudaMemcpy d_gamma D2H");
-        cuda_check_error(
-            cudaMemcpy(d_beta.data(), d_beta_gpu.data(), D * sizeof(float), cudaMemcpyDeviceToHost),
-            "cudaMemcpy d_beta D2H");
-
-
+        // Return param grads on the same device as gamma/beta (CPU or CUDA).
+        // If gamma was moved to GPU via to_cuda(), we return GPU grads so the
+        // autograd accumulation is device-consistent.
+        Tensor d_gamma({D}, gamma.dtype(), gamma.device());
+        Tensor d_beta ({D}, gamma.dtype(), gamma.device());
+        if (gamma.device() == Device::CUDA) {
+            cuda_check_error(
+                cudaMemcpy(d_gamma.data(), d_gamma_gpu.data(), D * sizeof(float), cudaMemcpyDeviceToDevice),
+                "cudaMemcpy d_gamma D2D");
+            cuda_check_error(
+                cudaMemcpy(d_beta.data(), d_beta_gpu.data(), D * sizeof(float), cudaMemcpyDeviceToDevice),
+                "cudaMemcpy d_beta D2D");
+        } else {
+            cuda_check_error(
+                cudaMemcpy(d_gamma.data(), d_gamma_gpu.data(), D * sizeof(float), cudaMemcpyDeviceToHost),
+                "cudaMemcpy d_gamma D2H");
+            cuda_check_error(
+                cudaMemcpy(d_beta.data(), d_beta_gpu.data(), D * sizeof(float), cudaMemcpyDeviceToHost),
+                "cudaMemcpy d_beta D2H");
+        }
 
         d_x    .setRequiresGrad(false);
         d_gamma.setRequiresGrad(false);
@@ -541,6 +556,16 @@ std::vector<Tensor> CopyBackward::backward(const Tensor& pathDownGrad) {
     return {grad};
 }
 
+std::vector<Tensor> ReshapeBackward::backward(const Tensor& pathDownGrad) {
+    // The upstream gradient has the reshaped (output) shape; return a
+    // gradient with the original input shape.  Gradients arriving here are
+    // always contiguous (produced by CUDA kernels or prior backward ops),
+    // so view() is free — no additional copy is needed.
+    Tensor grad = pathDownGrad.contiguous().view(original_shape);
+    grad.setRequiresGrad(false);
+    return {grad};
+}
+
 std::vector<Tensor> SoftmaxBackward::backward(const Tensor& pathDownGrad) {
     // inputs[0] = original pre-softmax logits x
     // dx_i = s_i * (dy_i - sum_j (dy_j * s_j))  where s = softmax(x)
@@ -576,7 +601,7 @@ std::vector<Tensor> SoftmaxBackward::backward(const Tensor& pathDownGrad) {
                               static_cast<float*>(dx.data()),
                               outer_size, dim_size);
         cuda_check_error(cudaGetLastError(), "cuda_softmax backward kernels failed");
-        cuda_check_error(cudaDeviceSynchronize(), "cudaDeviceSynchronize after SoftmaxBackward");
+        // No sync: result stays on GPU; next kernel serialized on default stream.
         return {dx};
     }
 #endif
@@ -689,6 +714,7 @@ std::vector<Tensor> EmbeddingBackward::backward(const Tensor& pathDownGrad) {
 
     if (grad.device() == Device::CUDA) {
 #ifdef USE_CUDA
+        // Run the backward kernel into a GPU buffer.
         Tensor d_weight_gpu(weight_shape, weight.dtype(), Device::CUDA);
         cuda_fill(static_cast<float*>(d_weight_gpu.data()), 0.0f,
                   static_cast<int64_t>(d_weight_gpu.numel()));
@@ -699,13 +725,21 @@ std::vector<Tensor> EmbeddingBackward::backward(const Tensor& pathDownGrad) {
                                 static_cast<int>(total_indices),
                                 static_cast<int>(D));
         cuda_check_error(cudaGetLastError(), "cuda_embedding_backward failed");
-        cuda_check_error(cudaDeviceSynchronize(), "cudaDeviceSynchronize after embedding backward");
+        // No sync: cudaMemcpy(D2D/D2H) below handles synchronization — D2H
+        // cudaMemcpy is inherently synchronous on the default stream.
 
-        cuda_check_error(
-            cudaMemcpy(d_weight.data(), d_weight_gpu.data(),
-                       static_cast<size_t>(num_embeddings * D * sizeof(float)),
-                       cudaMemcpyDeviceToHost),
-            "cudaMemcpy d_weight D2H");
+        // Return the gradient on the same device as the weight so that the
+        // autograd accumulation is device-consistent.
+        size_t bytes = static_cast<size_t>(num_embeddings * D) * sizeof(float);
+        if (weight.device() == Device::CUDA) {
+            cuda_check_error(
+                cudaMemcpy(d_weight.data(), d_weight_gpu.data(), bytes, cudaMemcpyDeviceToDevice),
+                "cudaMemcpy d_weight D2D");
+        } else {
+            cuda_check_error(
+                cudaMemcpy(d_weight.data(), d_weight_gpu.data(), bytes, cudaMemcpyDeviceToHost),
+                "cudaMemcpy d_weight D2H");
+        }
 #else
         throw std::runtime_error("CUDA not available");
 #endif

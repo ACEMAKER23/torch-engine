@@ -8,8 +8,22 @@
 #include <stdexcept>
 #include <cmath>
 #include <optional>
-#include <stack>
+#include <queue>
+#include <unordered_map>
+#include <unordered_set>
 #include <type_traits>
+#include <map>
+#include <string>
+#include <vector>
+#include <algorithm>
+#include <iostream>
+#include <iomanip>
+#include <typeinfo>
+#include <chrono>
+
+#ifdef __GNUC__
+#include <cxxabi.h>
+#endif
 
 
 #ifdef USE_CUDA
@@ -146,6 +160,34 @@ Tensor Tensor::contiguous() const {
     size_t offset = impl_->offset();
     size_t ndim = shape.size();
 
+#ifdef USE_CUDA
+    if (device() == Device::CUDA) {
+        // Use a CUDA gather kernel to rearrange strided → row-major on device.
+        int64_t ndim_i = static_cast<int64_t>(ndim);
+        int64_t numel_i = static_cast<int64_t>(numElements);
+        int64_t off_i   = static_cast<int64_t>(offset);
+        if (impl_->dtype() == DType::Float32) {
+            cuda_gather_strided_f32(static_cast<const float*>(srcData),
+                                    static_cast<float*>(dstData),
+                                    shape.data(), strides.data(),
+                                    ndim_i, off_i, numel_i);
+        } else if (impl_->dtype() == DType::Int32) {
+            cuda_gather_strided_i32(static_cast<const int32_t*>(srcData),
+                                    static_cast<int32_t*>(dstData),
+                                    shape.data(), strides.data(),
+                                    ndim_i, off_i, numel_i);
+        } else if (impl_->dtype() == DType::Int64) {
+            cuda_gather_strided_i64(static_cast<const int64_t*>(srcData),
+                                    static_cast<int64_t*>(dstData),
+                                    shape.data(), strides.data(),
+                                    ndim_i, off_i, numel_i);
+        }
+        cuda_check_error(cudaGetLastError(), "cuda_gather_strided failed");
+        // No cudaDeviceSynchronize: result stays on GPU; next kernel on the
+        // same default stream is automatically serialized.
+    } else {
+#endif
+
     auto copy_loop = [&](auto* dst, const auto* src) {
         std::vector<int64_t> idx(ndim, 0);
         for (size_t flat = 0; flat < numElements; ++flat) {
@@ -173,6 +215,10 @@ Tensor Tensor::contiguous() const {
         copy_loop(static_cast<int64_t*>(dstData),
                   static_cast<const int64_t*>(srcData));
     }
+
+#ifdef USE_CUDA
+    } // end else (CPU path)
+#endif
 
     Tensor result(storage, shape, impl_->dtype());
     if (requiredGrad()) {
@@ -205,6 +251,38 @@ Tensor Tensor::view(const vector<int64_t>& newShape) const {
         result.setRequiresGrad(true);
     }
 
+    return result;
+}
+
+Tensor Tensor::reshape(const std::vector<int64_t>& new_shape) const {
+    size_t new_numel = 1;
+    for (int64_t d : new_shape) new_numel *= static_cast<size_t>(d);
+    if (new_numel != impl_->numel())
+        throw std::runtime_error("reshape: new shape must have the same number of elements");
+
+    // Fast path: if already contiguous, a zero-copy view suffices.  This
+    // creates a single ViewBackward node, same as calling view() directly.
+    if (is_contiguous()) return view(new_shape);
+
+    // Slow path: the tensor is non-contiguous (e.g. result of transpose_view),
+    // so a physical copy is required before the memory can be reinterpreted.
+    // We build the contiguous storage here and attach a single ReshapeBackward
+    // node — cheaper than the CopyBackward + ViewBackward pair that a naive
+    // contiguous().view() would create.
+    Tensor cont = contiguous();
+
+    auto new_impl = std::make_shared<TensorImpl>(
+        cont.impl_->storage(), new_shape, cont.impl_->dtype(),
+        static_cast<int64_t>(cont.impl_->offset()));
+    Tensor result(new_impl);
+
+    if (requiredGrad()) {
+        auto fn           = std::make_shared<ReshapeBackward>();
+        fn->inputs        = {*this};
+        fn->original_shape = impl_->shape();
+        result.setGradFn(fn);
+        result.setRequiresGrad(true);
+    }
     return result;
 }
 
@@ -251,13 +329,23 @@ Tensor Tensor::operator*(const Tensor& other) const{
     }
     if (device() == Device::CUDA) {
 #ifdef USE_CUDA
-        std::vector<int64_t> broadcasted_shape = broadcast_to_shape<float>(shape(), other.shape());
-        Tensor result(broadcasted_shape, dtype(), Device::CUDA);
-        dispatch_cuda_binary_op(*this, other, result, [](auto a, auto b, auto out, int64_t size) {
-            cuda_mul(a, b, out, size);
-        });
-        cuda_check_error(cudaGetLastError(), "CUDA mul failed");
-        return result;
+        {
+            std::vector<int64_t> bc = broadcast_to_shape<float>(shape(), other.shape());
+            Tensor a_c = broadcast(bc).contiguous();
+            Tensor b_c = other.broadcast(bc).contiguous();
+            Tensor result(bc, dtype(), Device::CUDA);
+            dispatch_cuda_binary_op(a_c, b_c, result, [](auto a, auto b, auto out, int64_t size) {
+                cuda_mul(a, b, out, size);
+            });
+            cuda_check_error(cudaGetLastError(), "CUDA mul failed");
+            if (requiredGrad() || other.requiredGrad()) {
+                auto fn = make_shared<MulBackward>();
+                fn->inputs = {*this, other};
+                result.impl_->set_grad_fn(fn);
+                result.impl_->set_requires_grad(true);
+            }
+            return result;
+        }
 #else
         throw std::runtime_error("CUDA not supported in this build");
 #endif
@@ -293,13 +381,23 @@ Tensor Tensor::operator+(const Tensor& other) const{
     }
     if (device() == Device::CUDA) {
 #ifdef USE_CUDA
-        std::vector<int64_t> broadcasted_shape = broadcast_to_shape<float>(shape(), other.shape());
-        Tensor result(broadcasted_shape, dtype(), Device::CUDA);
-        dispatch_cuda_binary_op(*this, other, result, [](auto a, auto b, auto out, int64_t size) {
-            cuda_add(a, b, out, size);
-        });
-        cuda_check_error(cudaGetLastError(), "CUDA add failed");
-        return result;
+        {
+            std::vector<int64_t> bc = broadcast_to_shape<float>(shape(), other.shape());
+            Tensor a_c = broadcast(bc).contiguous();
+            Tensor b_c = other.broadcast(bc).contiguous();
+            Tensor result(bc, dtype(), Device::CUDA);
+            dispatch_cuda_binary_op(a_c, b_c, result, [](auto a, auto b, auto out, int64_t size) {
+                cuda_add(a, b, out, size);
+            });
+            cuda_check_error(cudaGetLastError(), "CUDA add failed");
+            if (requiredGrad() || other.requiredGrad()) {
+                auto fn = make_shared<AddBackward>();
+                fn->inputs = {*this, other};
+                result.impl_->set_grad_fn(fn);
+                result.impl_->set_requires_grad(true);
+            }
+            return result;
+        }
 #else
         throw std::runtime_error("CUDA not supported in this build");
 #endif
@@ -335,13 +433,23 @@ Tensor Tensor::operator-(const Tensor& other) const{
     }
     if (device() == Device::CUDA) {
 #ifdef USE_CUDA
-        std::vector<int64_t> broadcasted_shape = broadcast_to_shape<float>(shape(), other.shape());
-        Tensor result(broadcasted_shape, dtype(), Device::CUDA);
-        dispatch_cuda_binary_op(*this, other, result, [](auto a, auto b, auto out, int64_t size) {
-            cuda_sub(a, b, out, size);
-        });
-        cuda_check_error(cudaGetLastError(), "CUDA sub failed");
-        return result;
+        {
+            std::vector<int64_t> bc = broadcast_to_shape<float>(shape(), other.shape());
+            Tensor a_c = broadcast(bc).contiguous();
+            Tensor b_c = other.broadcast(bc).contiguous();
+            Tensor result(bc, dtype(), Device::CUDA);
+            dispatch_cuda_binary_op(a_c, b_c, result, [](auto a, auto b, auto out, int64_t size) {
+                cuda_sub(a, b, out, size);
+            });
+            cuda_check_error(cudaGetLastError(), "CUDA sub failed");
+            if (requiredGrad() || other.requiredGrad()) {
+                auto fn = make_shared<SubBackward>();
+                fn->inputs = {*this, other};
+                result.impl_->set_grad_fn(fn);
+                result.impl_->set_requires_grad(true);
+            }
+            return result;
+        }
 #else
         throw std::runtime_error("CUDA not supported in this build");
 #endif
@@ -377,13 +485,23 @@ Tensor Tensor::operator/(const Tensor& other) const{
     }
     if (device() == Device::CUDA) {
 #ifdef USE_CUDA
-        std::vector<int64_t> broadcasted_shape = broadcast_to_shape<float>(shape(), other.shape());
-        Tensor result(broadcasted_shape, dtype(), Device::CUDA);
-        dispatch_cuda_binary_op(*this, other, result, [](auto a, auto b, auto out, int64_t size) {
-            cuda_div(a, b, out, size);
-        });
-        cuda_check_error(cudaGetLastError(), "CUDA div failed");
-        return result;
+        {
+            std::vector<int64_t> bc = broadcast_to_shape<float>(shape(), other.shape());
+            Tensor a_c = broadcast(bc).contiguous();
+            Tensor b_c = other.broadcast(bc).contiguous();
+            Tensor result(bc, dtype(), Device::CUDA);
+            dispatch_cuda_binary_op(a_c, b_c, result, [](auto a, auto b, auto out, int64_t size) {
+                cuda_div(a, b, out, size);
+            });
+            cuda_check_error(cudaGetLastError(), "CUDA div failed");
+            if (requiredGrad() || other.requiredGrad()) {
+                auto fn = make_shared<DivBackward>();
+                fn->inputs = {*this, other};
+                result.impl_->set_grad_fn(fn);
+                result.impl_->set_requires_grad(true);
+            }
+            return result;
+        }
 #else
         throw std::runtime_error("CUDA not supported in this build");
 #endif
@@ -412,22 +530,29 @@ Tensor Tensor::operator/(const Tensor& other) const{
 }
 
 Tensor Tensor::operator-() const {
-    Tensor result = clone();
+    Tensor result(shape(), dtype(), device());
+#ifdef USE_CUDA
+    if (device() == Device::CUDA) {
+        if (dtype() == DType::Float32) {
+            cuda_negate_f32(static_cast<const float*>(data()),
+                            static_cast<float*>(result.data()),
+                            static_cast<int64_t>(numel()));
+            cuda_check_error(cudaGetLastError(), "cuda_negate_f32 failed");
+        } else {
+            throw std::runtime_error("CUDA unary negate only supports Float32");
+        }
+        return result;
+    }
+#endif
     switch (impl_->dtype()) {
         case DType::Float32:
-            for (size_t i = 0; i < result.numel(); ++i) {
-                result.at<float>(i) = -result.at<float>(i);
-            }
+            for (size_t i = 0; i < numel(); ++i) result.at<float>(i)   = -at<float>(i);
             break;
         case DType::Int32:
-            for (size_t i = 0; i < result.numel(); ++i) {
-                result.at<int32_t>(i) = -result.at<int32_t>(i);
-            }
+            for (size_t i = 0; i < numel(); ++i) result.at<int32_t>(i) = -at<int32_t>(i);
             break;
         case DType::Int64:
-            for (size_t i = 0; i < result.numel(); ++i) {
-                result.at<int64_t>(i) = -result.at<int64_t>(i);
-            }
+            for (size_t i = 0; i < numel(); ++i) result.at<int64_t>(i) = -at<int64_t>(i);
             break;
         default:
             throw std::runtime_error("Unsupported dtype");
@@ -529,7 +654,7 @@ Tensor Tensor::gelu() const {
                           static_cast<float*>(result.data()),
                           static_cast<int64_t>(numel()));
                 cuda_check_error(cudaGetLastError(), "cuda_gelu failed");
-                cuda_check_error(cudaDeviceSynchronize(), "cudaDeviceSynchronize after gelu");
+                // No sync: result stays on GPU; next kernel serialized on default stream.
                 break;
             }
 #endif
@@ -659,6 +784,30 @@ Tensor Tensor::matmul(const Tensor& other) const {
     return *result;
 }
 
+Tensor Tensor::sum_to_scalar() const {
+    Tensor result({1}, dtype(), device());
+    result.fill_<float>(0.0f);
+
+#ifdef USE_CUDA
+    if (device() == Device::CUDA) {
+        cuda_reduce_sum(static_cast<const float*>(data()),
+                        static_cast<float*>(result.data()),
+                        static_cast<int64_t>(numel()));
+        cuda_check_error(cudaGetLastError(), "cuda_reduce_sum failed");
+        // No cudaDeviceSynchronize here: the result is a GPU tensor and the
+        // following GPU operations on the same stream are naturally ordered.
+        return result;
+    }
+#endif
+
+    float total = 0.0f;
+    for (size_t i = 0; i < numel(); ++i) {
+        total += at<float>(i);
+    }
+    result.at<float>(0) = total;
+    return result;
+}
+
 Tensor Tensor::sum(int64_t dim) const {
     if (dim < 0 || dim >= static_cast<int64_t>(shape().size())) {
         throw std::runtime_error("Dimension out of range for sum");
@@ -734,7 +883,8 @@ void Tensor::sum_impl(Tensor& result, int64_t dim) const {
                          d_out_shape, d_out_strides,
                          dim, ndim, static_cast<int64_t>(result.numel()), in_shape[dim]);
             cuda_check_error(cudaGetLastError(), "cuda_sum_dim failed");
-            cuda_check_error(cudaDeviceSynchronize(), "cudaDeviceSynchronize after sum_dim");
+            // No explicit sync: cudaFree (non-async) is itself a blocking call
+            // that waits for all preceding GPU work before releasing memory.
 
             cuda_check_error(cudaFree(d_in_shape), "cudaFree d_in_shape");
             cuda_check_error(cudaFree(d_in_strides), "cudaFree d_in_strides");
@@ -821,6 +971,58 @@ Tensor Tensor::broadcast(const std::vector<int64_t>& target_shape) const {
     return Tensor(new_impl);
 }
 
+// ---------------------------------------------------------------------------
+// Per-GradFn backward profiling (development/debugging only).
+// ---------------------------------------------------------------------------
+static bool g_grad_profile_enabled = false;
+static std::map<std::string, double> g_grad_profile_times;
+
+#ifdef __GNUC__
+static std::string demangle_grad_name(const char* mangled) {
+    int status = 0;
+    char* demangled = abi::__cxa_demangle(mangled, nullptr, nullptr, &status);
+    std::string result = (status == 0 && demangled) ? demangled : mangled;
+    if (demangled) free(demangled);
+    // Strip the namespace/class prefix for brevity.
+    size_t pos = result.rfind("::");
+    if (pos != std::string::npos) result = result.substr(pos + 2);
+    return result;
+}
+#else
+static std::string demangle_grad_name(const char* mangled) { return mangled; }
+#endif
+
+void Tensor::enable_grad_profile(bool enable) {
+    g_grad_profile_enabled = enable;
+}
+
+void Tensor::reset_grad_profile() {
+    g_grad_profile_times.clear();
+}
+
+void Tensor::print_grad_profile() {
+    if (g_grad_profile_times.empty()) return;
+    std::vector<std::pair<std::string, double>> v(g_grad_profile_times.begin(),
+                                                  g_grad_profile_times.end());
+    std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) {
+        return a.second > b.second;
+    });
+    double total = 0.0;
+    for (const auto& kv : v) total += kv.second;
+    std::cerr << "\n=== GradFn backward profile (synced GPU time) ===\n";
+    std::cerr << std::left << std::setw(32) << "Op" << std::right
+              << std::setw(12) << "ms" << std::setw(10) << "%" << "\n";
+    for (const auto& kv : v) {
+        double pct = (total > 0.0) ? (kv.second / total) * 100.0 : 0.0;
+        std::cerr << std::left << std::setw(32) << kv.first << std::right
+                  << std::fixed << std::setprecision(4) << std::setw(12) << kv.second
+                  << std::setw(10) << std::setprecision(2) << pct << "\n";
+    }
+    std::cerr << std::left << std::setw(32) << "TOTAL" << std::right
+              << std::setw(12) << std::fixed << std::setprecision(4) << total << "\n";
+    std::cerr << "==================================================\n";
+}
+
 void Tensor::backward() {
     // Seed gradient is ones with the same shape as this tensor (d(loss)/d(loss) = 1).
     Tensor grad_output(impl_->shape(), impl_->dtype(), impl_->storage()->device());
@@ -843,33 +1045,116 @@ void Tensor::backward() {
 }
 
 void Tensor::backward_impl(const Tensor& passedDownGrad){
-    stack<pair<Tensor,Tensor>> currentPre;
-    currentPre.push({*this,passedDownGrad});
+    // ── Phase 1: BFS graph discovery + consumer (in-degree) counting ────────
+    //
+    // Each GradFn is the unique node that produced one tensor.  We use the raw
+    // GradFn pointer as the node identity — it is stable for the lifetime of
+    // the computation graph (kept alive by shared_ptr chains in the TensorImpls).
+    //
+    // in_degree[fn] = number of downstream nodes (consumers) that list fn as an
+    // input and that also require grad.  A node is "ready" when this count
+    // reaches 0, meaning every consumer has already accumulated its gradient.
+    using GradFnPtr = GradFn*;
 
-    while (!currentPre.empty()){
-        auto current = currentPre.top();
-        //gradient of all the input to the current tensor
-        currentPre.pop();
+    std::unordered_map<GradFnPtr, int>    in_degree;
+    std::unordered_set<GradFnPtr>         discovered;
 
-        if (!current.first.gradFn()) continue;
-        auto inputGradent=current.first.gradFn()->backward(current.second);
+    GradFnPtr root_fn = impl_->grad_fn().get();
+    if (!root_fn) return;
 
-        for(size_t i=0; i<inputGradent.size(); ++i){
-            // input shares its TensorImpl (data + autograd state) with the
-            // original tensor, so writing the gradient here propagates back to
-            // the leaf the user holds.
-            Tensor& input = current.first.gradFn()->inputs[i];
+    std::queue<GradFnPtr> bfs;
+    bfs.push(root_fn);
+    discovered.insert(root_fn);
+    // Root has no consumers; default int value is 0 so the [] access is enough,
+    // but be explicit for clarity.
+    in_degree[root_fn] = 0;
 
-            if (input.requiredGrad() && !input.gradFn()){  // Leaf node requiring grad
-                if (!input.impl_->grad()) {
-                    input.impl_->set_grad(make_shared<Tensor>(inputGradent[i]));
-                } else {
-                    // Accumulate if gradient already exists
-                    *input.impl_->grad() = *input.impl_->grad() + inputGradent[i];
-                }
+    while (!bfs.empty()) {
+        GradFnPtr fn = bfs.front();
+        bfs.pop();
+
+        for (const Tensor& inp : fn->inputs) {
+            if (!inp.requiredGrad()) continue;
+            GradFnPtr inp_fn = inp.gradFn().get();
+            if (!inp_fn) continue;   // leaf — has no GradFn node to track
+
+            // fn is a consumer of inp_fn, so increment inp_fn's in-degree.
+            in_degree[inp_fn]++;
+
+            // Only enqueue inp_fn for BFS traversal the first time we see it.
+            if (discovered.find(inp_fn) == discovered.end()) {
+                discovered.insert(inp_fn);
+                bfs.push(inp_fn);
             }
-            else if (input.requiredGrad()){  // Non-leaf, continue traversal
-                currentPre.push({input,inputGradent[i]});
+        }
+    }
+
+    // ── Phase 2: Topological processing (Kahn's algorithm) ──────────────────
+    //
+    // node_grad[fn] accumulates all upstream gradients flowing into fn before
+    // fn->backward() is called.  A node is enqueued in `ready` only when its
+    // in_degree has been decremented to 0 by all of its consumers.
+    std::unordered_map<GradFnPtr, Tensor> node_grad;
+    node_grad.emplace(root_fn, passedDownGrad);
+
+    std::queue<GradFnPtr> ready;
+    ready.push(root_fn);   // root has in_degree == 0 already
+
+    while (!ready.empty()) {
+        GradFnPtr fn = ready.front();
+        ready.pop();
+
+        const Tensor& upstream = node_grad.at(fn);
+
+        // ── Call this node's backward exactly once ─────────────────────────
+        std::vector<Tensor> input_grads;
+        if (g_grad_profile_enabled) {
+            auto t0 = std::chrono::high_resolution_clock::now();
+            input_grads = fn->backward(upstream);
+#ifdef USE_CUDA
+            cudaDeviceSynchronize();
+#endif
+            auto t1 = std::chrono::high_resolution_clock::now();
+            double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            g_grad_profile_times[demangle_grad_name(typeid(*fn).name())] += ms;
+        } else {
+            input_grads = fn->backward(upstream);
+        }
+
+        // Free the upstream gradient buffer — we no longer need it.
+        node_grad.erase(fn);
+
+        // ── Distribute gradients to each input ────────────────────────────
+        for (size_t i = 0; i < input_grads.size() && i < fn->inputs.size(); ++i) {
+            Tensor& inp = fn->inputs[i];
+            if (!inp.requiredGrad()) continue;
+
+            GradFnPtr inp_fn = inp.gradFn().get();
+
+            if (!inp_fn) {
+                // ── Leaf: accumulate directly into inp.grad ───────────────
+                // input shares its TensorImpl with the original tensor, so
+                // writing here propagates back to the leaf the user holds.
+                if (!inp.impl_->grad()) {
+                    inp.impl_->set_grad(std::make_shared<Tensor>(input_grads[i]));
+                } else {
+                    *inp.impl_->grad() = *inp.impl_->grad() + input_grads[i];
+                }
+            } else {
+                // ── Non-leaf: accumulate into node_grad[inp_fn] ──────────
+                // We do NOT call inp_fn->backward yet; we wait until all of
+                // inp_fn's consumers have contributed (in_degree reaches 0).
+                auto it = node_grad.find(inp_fn);
+                if (it == node_grad.end()) {
+                    node_grad.emplace(inp_fn, input_grads[i]);
+                } else {
+                    it->second = it->second + input_grads[i];
+                }
+
+                // Decrement consumer count; enqueue when all consumers done.
+                if (--in_degree[inp_fn] == 0) {
+                    ready.push(inp_fn);
+                }
             }
         }
     }
@@ -915,7 +1200,7 @@ Tensor Tensor::softmax(int64_t dim) {
                                  static_cast<float*>(out.data()),
                                  outer_size, dim_size);
             cuda_check_error(cudaGetLastError(), "cuda_softmax_forward failed");
-            cuda_check_error(cudaDeviceSynchronize(), "cudaDeviceSynchronize after softmax");
+            // No sync: result stays on GPU; next kernel serialized on default stream.
 
             if (requiredGrad()) {
                 auto fn = std::make_shared<SoftmaxBackward>();
