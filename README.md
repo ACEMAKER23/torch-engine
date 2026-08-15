@@ -1,905 +1,418 @@
-# LLM Training Framework Roadmap
+﻿# TorchEngine
 
-## Project Vision
+> A C++17/CUDA deep learning framework inspired by PyTorch, built to expose and optimize the implementation details behind tensors, autograd, neural network layers, transformer models, and GPU kernels.
 
-Build a high-performance machine learning framework in C++ and CUDA focused specifically on Large Language Model (LLM) training.
+![C++17](https://img.shields.io/badge/C%2B%2B-17-blue)
+![CUDA](https://img.shields.io/badge/CUDA-optional-green)
+![Build](https://img.shields.io/badge/build-CMake-informational)
+![Tests](https://img.shields.io/badge/tests-GoogleTest-informational)
 
-The primary goal is educational:
+## Table of Contents
 
-- Understand every major component of modern deep learning frameworks.
-- Understand how transformers and LLM training work internally.
-- Understand GPU programming and performance optimization.
+- [Overview](#overview)
+- [Key Features](#key-features)
+- [Architecture / Design](#architecture--design)
+- [CUDA & Performance](#cuda--performance)
+- [Supported Operations](#supported-operations)
+- [Autograd](#autograd)
+- [Building](#building)
+- [Usage](#usage)
+- [Examples](#examples)
+- [Benchmarking](#benchmarking)
+- [Roadmap](#roadmap)
+- [Project Structure](#project-structure)
+- [Contributing](#contributing)
+- [License](#license)
 
-The secondary goal is performance:
+## Overview
 
-- Create a framework capable of competing with or exceeding PyTorch performance for LLM training workloads.
-- Prioritize LLM-specific optimizations over general-purpose flexibility.
+TorchEngine is a small deep learning framework implemented in C++ and CUDA. It is designed as a systems and ML engineering project for understanding how modern tensor libraries and training frameworks are built: tensor metadata, storage ownership, CPU/GPU dispatch, reverse-mode automatic differentiation, neural network modules, optimizer state, and CUDA kernel optimization.
 
----
+The project intentionally keeps the implementation visible. Instead of wrapping a full external tensor library, TorchEngine implements its own tensor abstraction, autograd graph, module interfaces, optimizers, CUDA allocation path, CUDA kernels, and benchmark harnesses. cuBLAS is used where appropriate as a production baseline for GEMM, while custom matrix multiplication kernels are kept in the repository for experimentation and profiling.
 
-# Core Philosophy
+TorchEngine is not a drop-in replacement for PyTorch. The current repository is best viewed as a focused implementation and benchmarking environment for learning, testing, and iterating on deep learning framework internals.
 
-## Learning First
+## Key Features
 
-The project is designed to teach the underlying concepts behind:
+| Area | Status | Notes |
+| --- | --- | --- |
+| Tensor abstraction | Implemented | `Tensor`, `TensorImpl`, and `Storage` separation with shape, stride, offset, dtype, device, views, slicing, reshape, transpose, broadcasting, and contiguous copies. |
+| CPU tensor operations | Implemented | Elementwise arithmetic, reductions, activations, softmax, and N-dimensional/batched matrix multiplication. |
+| CUDA tensor execution | Implemented / in progress | CUDA allocator, host/device transfers, CUDA elementwise ops, reductions, softmax, layer norm, embedding, cross entropy, GELU, AdamW update, and FP32 tensor matmul through cuBLAS or a custom backend. |
+| Autograd | Implemented | Reverse-mode autodiff with explicit `GradFn` nodes, gradient accumulation, broadcasting-aware backward reductions, and backward implementations for core tensor and layer operations. |
+| Neural network modules | Implemented | `Module`, `Linear`, `Embedding`, `LayerNorm`, `Dropout`, `ReLU`, `GeLU`, `Sequential`, scaled dot-product attention, multi-head attention, feed-forward network, transformer block, and GPT-style model. |
+| Optimizers | Implemented | SGD, Adam, and AdamW. AdamW has a CUDA fused update path for CUDA tensors. |
+| Mixed precision utilities | In progress | `Float16`/`BFloat16` dtype utilities, dtype casting, master-weight support in the optimizer base, and a loss scaler are present. Full mixed-precision training is not yet a complete feature. |
+| Benchmarks | Implemented | GPT CPU/GPU benchmark, PyTorch comparison scripts, GEMM backend comparison, custom CUDA matmul sweep, and Nsight Compute sweep helper. |
+| Distributed training | Planned | No distributed runtime is implemented. |
 
-- Tensor systems
-- Automatic differentiation
-- Neural network layers
-- CUDA programming
-- Transformer architectures
-- Distributed training
-- Performance optimization
+## Architecture / Design
 
-We will implement components from scratch instead of relying heavily on external frameworks.
+TorchEngine follows a layered design similar to the internal structure of mainstream tensor frameworks.
 
----
-
-## Build in Layers
-
-We will not optimize prematurely.
-
-Each phase should:
-
-1. Work correctly
-2. Be thoroughly understood
-3. Be benchmarked
-4. Be optimized
-
-Correctness always comes before optimization.
-
----
-
-## Performance-Oriented Design
-
-Even in early stages we should make architectural decisions that support future optimization.
-
-Examples:
-
-- Separate Tensor from Storage
-- Support tensor views
-- Avoid unnecessary memory copies
-- Design with CUDA in mind
-- Enable future kernel fusion
-
----
-
-# High Level Architecture
-
-```text
-Application Layer
-│
-├── GPT Models
-├── Transformer Blocks
-└── Training Loops
-
-Neural Network Layer
-│
-├── Linear
-├── Embedding
-├── LayerNorm
-├── Attention
-└── Activations
-
-Autograd Engine
-│
-├── Computation Graph
-├── GradFn Nodes
-└── Backward Pass
-
-Tensor Layer
-│
-├── Tensor
-├── TensorImpl
-├── Storage
-└── Shape/Stride Logic
-
-Backend Layer
-│
-├── CPU Kernels
-├── CUDA Kernels
-├── Memory Pools
-└── Streams
+```mermaid
+flowchart TD
+    A[Applications and Benchmarks] --> B[GPT / Transformer Modules]
+    B --> C[Neural Network Modules]
+    C --> D[Autograd Engine]
+    D --> E[Tensor API]
+    E --> F[TensorImpl Metadata]
+    F --> G[Storage]
+    G --> H[CPU Allocator]
+    G --> I[CUDA Allocator]
+    E --> J[CPU Kernels]
+    E --> K[CUDA Kernels / cuBLAS]
 ```
 
----
+### Core Abstractions
 
-# Phase 0: Architecture Design
+| Component | Responsibility |
+| --- | --- |
+| `Tensor` | User-facing value type. Exposes shape, dtype, device, indexing, math ops, views, autograd controls, and `backward()`. |
+| `TensorImpl` | Shared tensor metadata: shape, strides, offset, dtype, `requires_grad`, accumulated gradient, and `grad_fn`. |
+| `Storage` | Raw memory ownership and allocator association. Storage can be CPU or CUDA. |
+| `Allocator` | CPU allocator uses `malloc`/`free`; CUDA allocator uses `cudaMalloc`/`cudaFree`. |
+| `GradFn` | Base class for backward nodes. Derived classes implement operation-specific gradient propagation. |
+| `Module` | Neural network layer interface: `forward`, `parameters`, `zero_grad`, and optional `to_cuda`. |
 
-## Goal
+Autograd metadata lives in the shared `TensorImpl`, not only in the lightweight `Tensor` handle. This preserves gradient state and graph connectivity across tensor copies and views.
 
-Design the framework before implementation.
+## CUDA & Performance
 
-## Deliverables
+CUDA support is enabled when CMake finds CUDA. The build defines `USE_CUDA`, compiles `src/cuda/elementwise_cuda.cu`, enables CUDA language support, and links CUDA/cuBLAS libraries.
 
-- Roadmap
-- Directory structure
-- Tensor architecture
-- Coding standards
+### Implemented CUDA Paths
 
-## Why
+| Area | Implementation |
+| --- | --- |
+| Memory | `CUDAAllocator` wraps `cudaMalloc` and `cudaFree`; `Tensor::toDevice` moves tensors between CPU and CUDA. |
+| Elementwise kernels | Add, subtract, multiply, divide, ReLU, GELU, negation, and fill kernels. |
+| Reductions | Scalar sum and dimension-wise sum kernels. |
+| Softmax | Forward and backward CUDA kernels. |
+| Layers | CUDA layer norm, embedding, batched cross entropy, and GELU backward helpers. |
+| Optimizer | Fused CUDA AdamW update for FP32 parameters. |
+| Tensor matmul | FP32 CUDA tensor matmul uses cuBLAS by default, including strided batched cuBLAS where possible. |
+| Custom GEMM path | `TENSOR_GEMM_BACKEND=custom` routes contiguous row-major FP32 tensor matmul through a custom CUDA kernel and falls back to cuBLAS for unsupported layouts. |
 
-Changing core architecture later is extremely expensive.
+### Custom Matrix Multiplication Kernels
 
----
+The CUDA source includes multiple GEMM implementations for experimentation and benchmarking:
 
-# Phase 1: Tensor System
+| Kernel family | Status | Techniques present |
+| --- | --- | --- |
+| Naive GEMM | Implemented | One output element per thread baseline. |
+| Shared-memory GEMM | Implemented | Shared-memory tiles for data reuse. |
+| Register-blocked GEMM | Implemented | Per-thread output blocking with shared-memory staging. |
+| Vectorized-input GEMM | Implemented | `uint4` 16-byte vectorized memory movement where alignment/layout allows it. |
+| Warp-tiled GEMM | Implemented | Warp-level output tiling and thread-level register tiles. |
+| Double-buffered GEMM | Implemented | Two-stage shared-memory buffering. |
+| `cp.async` GEMM | Implemented | Asynchronous global-to-shared copies on SM80+ paths. |
+| Three-stage `cp.async` GEMM | Implemented | Multi-stage async pipeline. |
+| WMMA Tensor Core GEMM | Implemented | FP16 input / FP32 accumulator Tensor Core kernel using `nvcuda::wmma`. |
+| Ampere `mma.sync` GEMM | Implemented | FP16 input / FP32 accumulator path using inline `ldmatrix` / `mma.sync` assembly. |
 
-## Goal
+The custom kernels are benchmark targets and selectable for some tensor matmul workloads. cuBLAS remains the default tensor GEMM backend because it is broader and more robust across layouts.
 
-Build a production-quality tensor abstraction.
+## Supported Operations
 
-No autograd.
+### Tensor Operations
 
-No CUDA.
+| Operation | CPU | CUDA | Autograd |
+| --- | --- | --- | --- |
+| Construction, clone, fill | Implemented | Implemented | N/A |
+| CPU/GPU transfer | N/A | Implemented | Copy backward implemented |
+| Indexing with `at<T>` | Implemented | Limited direct host-side use | N/A |
+| View / reshape | Implemented | Implemented | Implemented |
+| Slice | Implemented | CPU metadata path | Not fully documented |
+| Transpose view | Implemented | Implemented | Implemented |
+| Contiguous copy | Implemented | Implemented via gather kernels | Copy backward implemented |
+| Broadcasting | Implemented | Used by CUDA-capable ops where supported | Implemented for binary ops |
+| Add / sub / mul / div | Implemented | Implemented | Implemented |
+| Unary negation | Implemented | Implemented for FP32 | Implemented |
+| Sum to scalar | Implemented | Implemented for FP32 | Used by backward paths |
+| Sum over dimension | Implemented | Implemented for FP32 | Used for broadcast gradient reduction |
+| Mean / min / max | Implemented on CPU | Not exposed as full CUDA reductions | Not fully implemented |
+| ReLU | Implemented | Implemented | Implemented |
+| GELU | Implemented | Implemented for FP32 | Implemented |
+| Sigmoid | Implemented | CPU path | Implemented |
+| Sqrt / exp / log / pow | Implemented | CPU path | Not fully implemented |
+| Softmax | Implemented | Implemented for FP32 | Implemented |
+| Matmul | Implemented | Implemented for FP32 tensors | Implemented |
 
-CPU only.
+### Neural Network Components
 
----
+| Component | Status | Notes |
+| --- | --- | --- |
+| `Linear` | Implemented | Matmul plus bias broadcasting; parameters support `requires_grad`; `to_cuda()` implemented. |
+| `Embedding` | Implemented | CPU and CUDA paths are present. |
+| `LayerNorm` | Implemented | CPU and CUDA paths are present with backward support. |
+| `Dropout` | Implemented | Training/inference behavior is tested. |
+| `ReLU`, `GeLU` | Implemented | Module wrappers over tensor activations. |
+| `Sequential` | Implemented | Basic module container. |
+| Scaled dot-product attention | Implemented | Tested for several input shapes. |
+| Multi-head attention | Implemented | Q/K/V projections and attention composition. |
+| Feed-forward network | Implemented | Used by transformer block. |
+| Transformer block | Implemented | LayerNorm, MHA, FFN, dropout, and residual structure. |
+| GPT model | Implemented | Token embedding, positional embedding, transformer blocks, final norm, and language-model head. |
 
-## Tensor Architecture
+### Losses and Optimizers
 
-```text
-Tensor
-    │
-    ▼
-TensorImpl
-    │
-    ▼
-Storage
+| Component | Status |
+| --- | --- |
+| Cross entropy | Implemented, including batched CUDA helper. |
+| MSE loss | Implemented. |
+| BCE loss | Implemented. |
+| L1 loss | Implemented. |
+| SGD | Implemented. |
+| Adam | Implemented. |
+| AdamW | Implemented, with CUDA FP32 update helper. |
+| Loss scaling | In progress utility; not a complete AMP training stack. |
+
+## Autograd
+
+TorchEngine implements reverse-mode automatic differentiation with explicit graph nodes.
+
+Forward operations create `GradFn` instances when at least one input requires gradients. Calling `loss.backward()` traverses the graph in reverse and accumulates gradients into leaf tensors.
+
+Implemented backward nodes include:
+
+- Binary arithmetic: add, subtract, multiply, divide
+- Matrix multiplication
+- ReLU, GELU, sigmoid
+- Cross entropy variants
+- MSE, BCE, L1
+- Transpose, view, reshape, copy
+- LayerNorm
+- Softmax
+- Embedding
+
+Broadcasting is handled during backward propagation by reducing gradients back to the original input shape. This is required for operations such as bias addition and broadcasted matmul batches.
+
+## Building
+
+### Dependencies
+
+- CMake 3.14 or newer
+- C++17 compiler
+- GoogleTest
+- CUDA Toolkit and cuBLAS for GPU support
+- Python 3 for benchmark orchestration scripts
+- PyTorch for comparison benchmarks only
+
+CUDA support is intended to be optional in CMake, but the current repository is primarily exercised with a CUDA-capable toolchain because some test and helper headers include CUDA runtime headers directly. For a full build and test run, use a CUDA Toolkit installation with cuBLAS available.
+
+### Configure and Build
+
+```bash
+cmake -S . -B build
+cmake --build build -j$(nproc)
 ```
 
----
+### Run Tests
 
-## Storage
+```bash
+cd build
+ctest --output-on-failure
+```
 
-Responsible for raw memory ownership.
+The CMake test suite currently registers the core tests and the general CUDA test target. Additional CUDA-specific test executables are built when CUDA is available and can be run directly:
 
-Contains:
+```bash
+./build/cuda_matmul_tensor_test
+./build/cuda_softmax_tensor_test
+./build/cuda_layernorm_tensor_test
+./build/cuda_embedding_tensor_test
+./build/cuda_crossentropy_tensor_test
+./build/cuda_gelu_tensor_test
+./build/cuda_reduction_tensor_test
+```
+
+## Usage
+
+The public API is intentionally close to a minimal PyTorch-like workflow: create tensors, run operations, call `backward()`, and update parameters with an optimizer.
 
 ```cpp
-void* data;
-size_t bytes;
-Device device;
-DType dtype;
+#include "tensor/tensor.h"
+#include "core/dtype.h"
+
+int main() {
+    Tensor x({2, 3}, DType::Float32, Device::CPU);
+    Tensor w({3, 4}, DType::Float32, Device::CPU);
+
+    x.fill_<float>(1.0f);
+    w.fill_<float>(0.5f);
+    w.setRequiresGrad(true);
+
+    Tensor y = x.matmul(w);
+    Tensor loss = y.sum_to_scalar();
+    loss.backward();
+
+    return 0;
+}
 ```
 
-Responsibilities:
-
-- Memory allocation
-- Memory deallocation
-- Device tracking
-
----
-
-## TensorImpl
-
-Responsible for metadata.
-
-Contains:
+CUDA tensors use the same `Tensor` type:
 
 ```cpp
-shape
-strides
-offset
-storage
+Tensor cpu({1024, 1024}, DType::Float32, Device::CPU);
+cpu.fill_<float>(1.0f);
+
+Tensor gpu = cpu.toDevice(Device::CUDA);
+Tensor out = gpu.matmul(gpu);
+Tensor back = out.toDevice(Device::CPU);
 ```
 
-Responsibilities:
+## Examples
 
-- Shape management
-- View support
-- Slicing support
-
----
-
-## Tensor
-
-User-facing API.
-
-Example:
+### Linear Layer
 
 ```cpp
-Tensor a({2, 3});
-Tensor b = a.view({3, 2});
-```
+#include "nn/linear.h"
+#include "optimizer/sgd.h"
 
-Responsibilities:
+Tensor input({8, 16}, DType::Float32, Device::CPU);
+input.fill_<float>(1.0f);
 
-- Public interface
-- Reference semantics
+Linear layer(16, 32, DType::Float32);
+Tensor output = layer.forward(input);
+Tensor loss = output.sum_to_scalar();
 
----
-
-## Features
-
-### Shapes
-
-```cpp
-tensor.shape()
-```
-
-### Strides
-
-```cpp
-tensor.strides()
-```
-
-### Number of Elements
-
-```cpp
-tensor.numel()
-```
-
-### Views
-
-```cpp
-tensor.view(...)
-```
-
-### Slices
-
-```cpp
-tensor.slice(...)
-```
-
----
-
-## Why This Design
-
-Allows:
-
-- Zero-copy views
-- Tensor slicing
-- Efficient memory sharing
-- Future CUDA compatibility
-
-This is similar to PyTorch's internal design.
-
----
-
-# Phase 2: CPU Tensor Operations
-
-## Goal
-
-Build a numerical backend.
-
-Still no gradients.
-
----
-
-## Operations
-
-### Elementwise
-
-```cpp
-add
-sub
-mul
-div
-```
-
-### Reductions
-
-```cpp
-sum
-mean
-max
-```
-
-### Matrix Operations
-
-```cpp
-matmul
-transpose
-```
-
----
-
-## Why Before Autograd
-
-We want to separate:
-
-```text
-Math Engine
-```
-
-from
-
-```text
-Gradient Engine
-```
-
-This makes debugging significantly easier.
-
----
-
-# Phase 3: Automatic Differentiation
-
-## Goal
-
-Implement reverse-mode autodiff.
-
-Equivalent to PyTorch autograd.
-
----
-
-## Tensor Additions
-
-```cpp
-requires_grad
-grad
-grad_fn
-```
-
----
-
-## Graph Nodes
-
-Base class:
-
-```cpp
-class GradFn
-{
-public:
-    virtual std::vector<Tensor>
-    backward(const Tensor& grad) = 0;
-};
-```
-
----
-
-## Backward Operations
-
-Implement:
-
-```cpp
-AddBackward
-SubBackward
-MulBackward
-MatMulBackward
-```
-
----
-
-## Why Node Classes
-
-Alternative:
-
-```cpp
-std::function
-```
-
-We will avoid this.
-
-Reasons:
-
-- Extra allocations
-- Harder to optimize
-- Worse cache behavior
-
-Node classes are closer to PyTorch.
-
----
-
-# Phase 4: Backward Engine
-
-## Goal
-
-Implement:
-
-```cpp
 loss.backward();
+
+sgd opt(layer.parameters());
+opt.step(1e-3f);
+opt.zero_grad();
 ```
 
----
-
-## Components
-
-### Graph Traversal
-
-Topological sort
-
-### Gradient Propagation
-
-Reverse graph execution
-
-### Gradient Accumulation
+### GPT-Style Model
 
 ```cpp
-param.grad += incoming_grad;
+#include "nn/gpt.h"
+#include "loss/CrossEntropyLoss.h"
+#include "optimizer/adamw.h"
+
+GPT model(
+    /* vocabSize */ 65,
+    /* maxSeqLen */ 128,
+    /* embedDim */ 64,
+    /* numHeads */ 4,
+    /* numLayers */ 2,
+    /* ffDim */ 256,
+    DType::Float32,
+    /* dropoutRate */ 0.0f
+);
+
+Tensor tokens({2, 16}, DType::Int64, Device::CPU);
+Tensor targets({2, 16}, DType::Int64, Device::CPU);
+
+Tensor logits = model.forward(tokens);
+CrossEntropyLoss loss_fn;
+Tensor loss = loss_fn.forward(logits, targets);
+
+loss.backward();
+
+adamw opt(model.parameters(), 0.9f, 0.999f, 1e-8f, 0.01f);
+opt.step(1e-3f);
 ```
 
----
+## Benchmarking
 
-## Deliverable
+TorchEngine includes benchmark programs and Python runners for reproducible local measurement. The benchmark suite compares:
 
-Train a simple neural network entirely on CPU.
+- TorchEngine GPT training throughput on CPU and CUDA
+- PyTorch GPT training throughput on CPU and CUDA
+- TorchEngine CUDA GPT training with cuBLAS GEMM vs the custom GEMM backend
+- Isolated custom CUDA matmul kernels vs cuBLAS baselines
 
----
+Run the full benchmark suite:
 
-# Phase 5: CUDA Infrastructure
-
-## Goal
-
-Add GPU support.
-
----
-
-## Device Abstraction
-
-```cpp
-enum class Device
-{
-    CPU,
-    CUDA
-};
+```bash
+python3 scripts/run_benchmark_suite.py \
+  --build-dir build \
+  --data data/tinyshakespeare.txt \
+  --output-dir benchmark_outputs \
+  --trials 7 \
+  --sizes small,medium,large \
+  --tensor-gemm-backends cublas,custom
 ```
 
----
+Run only the matmul sweep:
 
-## Storage Update
-
-```cpp
-void* ptr;
-Device device;
+```bash
+python3 scripts/run_benchmark_suite.py \
+  --skip-gpt \
+  --trials 7 \
+  --output-dir benchmark_outputs_matmul_only
 ```
 
----
+The repository contains existing benchmark artifacts under `benchmark_outputs/` and `gpt_benchmark_gpu_results.json`. Treat these as local measurements from a specific environment, not general performance claims. The recorded GPT summary includes seven-trial CPU/CUDA comparisons against PyTorch for small, medium, and large toy GPT configurations. The recorded single GPU result was collected on an NVIDIA GeForce RTX 4070 with CUDA runtime 12.6 for a small GPT configuration.
 
-## Why
+For methodology and interpretation rules, see [BENCHMARKING.md](BENCHMARKING.md).
 
-GPU memory cannot be treated like normal CPU memory.
+## Roadmap
 
-We need a generic abstraction.
+| Area | Status | Next Work |
+| --- | --- | --- |
+| Tensor system | Implemented | Improve API consistency and document unsupported edge cases. |
+| CPU autograd | Implemented | Expand gradient coverage for remaining unary/reduction operations. |
+| CUDA tensor integration | In progress | Broaden dtype/layout support and register CUDA-specific tests with CTest. |
+| Custom GEMM | In progress | Continue profiling against cuBLAS, document supported shapes/layouts, and keep correctness tests tied to each kernel generation. |
+| Mixed precision | In progress | Integrate loss scaling, master weights, FP16/BF16 kernels, and Tensor Core paths into complete training flows. |
+| Kernel fusion | Planned | Candidate fusions include bias+activation and transformer-block hot paths. |
+| Memory management | Planned | Replace repeated `cudaMalloc`/`cudaFree` in hot paths with a CUDA memory pool or caching allocator. |
+| Attention optimization | Planned | Investigate fused or FlashAttention-style attention kernels. |
+| Distributed training | Planned | No implementation yet. |
+| Public API hardening | Planned | Separate internal experiments from stable headers and add stronger documentation. |
 
----
+## Project Structure
 
-# Phase 6: CUDA Kernels
-
-## Goal
-
-Execute tensor operations on GPU.
-
----
-
-## Initial Kernels
-
-### Elementwise
-
-```cpp
-add
-sub
-mul
-div
+```text
+.
+|-- CMakeLists.txt
+|-- BENCHMARKING.md
+|-- TEST_PLAN.md
+|-- tensor.md
+|-- data/
+|   `-- tinyshakespeare.txt
+|-- scripts/
+|   |-- run_benchmark_suite.py
+|   |-- benchmark_pytorch_gpt.py
+|   `-- pytorch_gpu_benchmark.py
+|-- src/
+|   |-- core/          # dtype utilities, CUDA helpers, autograd nodes, allocators, loss scaling
+|   |-- cuda/          # CUDA kernels and GEMM implementations
+|   |-- tensor/        # Tensor, TensorImpl, Storage
+|   |-- nn/            # Modules, attention, transformer blocks, GPT
+|   |-- loss/          # Cross entropy, MSE, BCE, L1
+|   |-- optimizer/     # SGD, Adam, AdamW
+|   |-- tests/         # GoogleTest coverage
+|   `-- benchmarks/    # C++ benchmark binaries and profiling helpers
+`-- benchmark_outputs/ # Local benchmark artifacts
 ```
 
-### Reduction
+## Contributing
 
-```cpp
-sum
-```
+Contributions should preserve the repository's focus: correctness first, measurements before performance claims, and clear separation between implemented features and experiments.
 
-### Matrix Multiply
-
-```cpp
-matmul
-```
-
----
-
-## Learning Objectives
-
-Understand:
-
-- Thread hierarchy
-- Memory coalescing
-- Shared memory
-- Occupancy
-- Synchronization
-
----
-
-# Phase 7: Neural Network Components
-
-## Goal
-
-Build transformer building blocks.
-
----
-
-## Layers
-
-### Linear
-
-```cpp
-y = xW + b
-```
-
-### Embedding
-
-```cpp
-lookup table
-```
-
-### LayerNorm
-
-### GELU
-
-### Dropout
-
----
-
-## Deliverable
-
-Train an MLP using framework primitives.
-
----
-
-# Phase 8: Transformer Architecture
-
-## Goal
-
-Build GPT-style transformers.
-
----
-
-## Components
-
-### Multi-Head Attention
-
-### Feed Forward Network
-
-### Residual Connections
-
-### LayerNorm
-
-### Positional Embeddings
-
----
-
-## Deliverable
-
-Train a tiny GPT model.
-
----
-
-# Phase 9: Optimizers
-
-## Goal
-
-Implement training algorithms.
-
----
-
-## Optimizers
-
-### SGD
-
-### Adam
-
-### AdamW
-
----
-
-## State Tensors
-
-Store:
-
-```cpp
-m
-v
-```
-
-as tensors.
-
----
-
-## Deliverable
-
-Stable transformer training.
-
----
-
-# Phase 10: Mixed Precision Training
-
-## Goal
-
-Support modern training formats.
-
----
-
-## DTypes
-
-```cpp
-float32
-float16
-bfloat16
-```
-
----
-
-## Features
-
-### Master Weights
-
-### Loss Scaling
-
-### Mixed Precision Kernels
-
----
-
-## Deliverable
-
-Reduced memory usage and faster training.
-
----
-
-# Phase 11: LLM-Specific Optimization
-
-## Goal
-
-Compete with PyTorch.
-
----
-
-## Memory Pool
-
-Avoid:
-
-```cpp
-cudaMalloc
-cudaFree
-```
-
-during training.
-
----
-
-## Kernel Fusion
-
-Combine operations:
-
-```cpp
-bias + gelu
-```
-
-into a single kernel.
-
----
-
-## Flash Attention
-
-Implement:
-
-```cpp
-QK^T
-Softmax
-AV
-```
-
-without materializing large intermediate matrices.
-
----
-
-## CUDA Graphs
-
-Reduce launch overhead.
-
----
-
-## Tensor Core Optimization
-
-Target:
-
-```cpp
-FP16
-BF16
-```
-
-Tensor Core execution.
-
----
-
-# Phase 12: Distributed Training
-
-## Goal
-
-Scale beyond a single GPU.
-
----
-
-## Techniques
-
-### Data Parallelism
-
-### Tensor Parallelism
-
-### Pipeline Parallelism
-
----
-
-## Deliverable
-
-Multi-GPU transformer training.
-
----
-
-# Long-Term Vision
-
-The final framework should:
-
-- Train GPT-style models
-- Support CUDA acceleration
-- Support mixed precision
-- Support Flash Attention
-- Support distributed training
-- Be optimized specifically for LLM workloads
-
-Potential advantages over PyTorch:
-
-- Reduced abstraction overhead
-- LLM-focused execution model
-- Specialized kernels
-- Static graph opportunities
-- Better memory planning
-
----
-
-# Development Rules
-
-## Rule 1
-
-Understand every line before writing the next layer.
-
----
-
-## Rule 2
-
-Benchmark every major feature.
-
----
-
-## Rule 3
-
-Do not optimize code that is not measured.
-
----
-
-## Rule 4
-
-Correctness before performance.
-
----
-
-## Rule 5
-
-Keep APIs simple.
-
----
-
-## Rule 6
-
-Every abstraction must justify its runtime cost.
-
----
-
-# Current Status
-
-## Completed
-
-- **Phase 1 — Tensor System**: `Tensor` / `TensorImpl` / `Storage` separation, shapes,
-  strides, offsets, zero-copy views, slicing, transpose, broadcasting. (58 tests passing)
-- **Phase 2 — CPU Tensor Operations**: elementwise `+ - * /`, unary negation, `matmul`,
-  broadcasting-aware elementwise ops, `Float32` / `Int32` / `Int64` dtypes.
-- **Phase 3 — Automatic Differentiation**: `requires_grad`, `grad`, `grad_fn`; `GradFn`
-  base class with `AddBackward`, `SubBackward`, `MulBackward`, `DivBackward`,
-  `MatMulBackward` node classes; operators build the computation graph.
-- **Phase 4 — Backward Engine**: `loss.backward()`, reverse graph traversal, gradient
-  accumulation into leaf tensors. PyTorch-style architecture (autograd metadata in `TensorImpl`).
-  (43 autograd tests passing, including chained ops)
-- **Phase 5 — CPU Autograd & Broadcasting**:
-  - Broadcasting gradient reduction: Implemented `Tensor::sum(int64_t dim)` and
-    `reduce_gradient` helper. Updated all backward functions (Add, Sub, Mul, Div, MatMul) to
-    reduce gradients over broadcast dimensions.
-  - Activation function gradients: Implemented `ReluBackward`, `GeluBackward`,
-    `SigmoidBackward` with correct gradient formulas.
-  - Data type optimizations: Eliminated memory allocations, template-based dispatch,
-    reduced code duplication.
-  - Test coverage: 43 autograd tests passing (including complex tests, broadcasting
-    reduction tests, activation tests, edge case tests).
-- **Phase 7 — Neural Network Components**: All major components implemented on CPU
-  - `Module` base class with `forward()`, `parameters()`, `zero_grad()` interface
-  - `Linear` layer: Fully connected layer with weight/bias parameters, Xavier initialization
-  - `Embedding` layer: Token embedding lookup with learnable weights
-  - `LayerNorm`: Layer normalization with learnable weight/bias
-  - `Dropout`: Random neuron dropout with training/inference modes
-  - `Sequential`: Container for stacking layers
-  - `Residual`: Residual connection wrapper
-  - Test coverage: 51 tests passing (10 linear + 22 nn_layers + 19 attention)
-- **Phase 8 — Transformer Architecture (Partial)**:
-  - `ScaledDot`: Scaled dot-product attention with softmax
-  - `MultiHeadAttention`: Multi-head attention with Q/K/V projections
-  - `PositionalEmbedding`: Sinusoidal positional embeddings
-  - Missing: Feed Forward Network, complete Transformer block, GPT model
-
-## Key Architectural Decision (Phase 4)
-
-Autograd metadata (`requires_grad`, `grad`, `grad_fn`) lives inside the **shared**
-`TensorImpl`, not in the lightweight `Tensor` handle. This is the PyTorch
-(`Variable` / `TensorImpl` + `AutogradMeta`) model. It is what makes
-`loss.backward()` correct for chained operations — see `tensor.md` for the full
-explanation of the bug it fixes and why.
-
-## Key Implementation (Phase 5)
-
-Broadcasting gradient reduction: When a tensor is broadcast during forward pass
-(e.g., shape `[1,2]` → `[2,2]`), its gradient during backward pass must be summed
-over the broadcast dimensions to match the original shape. Implemented via
-`Tensor::sum(int64_t dim)` and `reduce_gradient` helper applied to all binary
-operation backward functions.
-
-## Not Yet Started
-
-- **Phase 5 — CUDA Infrastructure**: Device abstraction, GPU memory management (CUDA kernels exist but not integrated)
-- **Phase 6 — CUDA Kernels**: GPU elementwise ops, reductions, matmul (kernels exist but not integrated)
-- **Phase 8 — Transformer Architecture (Complete)**: Feed Forward Network, Transformer block, GPT model
-- **Phase 9 — Optimizers**: SGD, Adam, AdamW
-- **Phase 10 — Mixed Precision Training**: FP16/BF16 support
-- **Phase 11 — LLM-Specific Optimization**: Memory pools, kernel fusion, Flash Attention, CUDA graphs
-- **Phase 12 — Distributed Training**: Data parallelism, tensor parallelism, pipeline parallelism
-
-## In Progress / Next
-
-Decision point: Choose next phase
-- **Option A**: Phase 5-6 (CUDA Infrastructure & Kernels) - Integrate existing CUDA kernels
-- **Option B**: Phase 8 (Complete Transformer Architecture) - Build Feed Forward Network and GPT model
-- **Option C**: Phase 9 (Optimizers) - Implement SGD, Adam, AdamW for training
-
-## Building & Testing
+Before submitting changes:
 
 ```bash
 cmake -S . -B build
-cmake --build build
-./build/tensor_test       # tensor system + ops (58 tests)
-./build/autograd_test     # autograd + backward engine (43 tests)
-./build/linear_test       # linear layer tests (10 tests)
-./build/nn_layers_test    # neural network layers (22 tests)
-./build/attention_test    # attention mechanisms (19 tests)
+cmake --build build -j$(nproc)
+cd build
+ctest --output-on-failure
 ```
 
-## Future Optimizations
+For performance-related changes, include:
 
-The following optimization opportunities have been identified but deferred for future work:
+- The exact benchmark command
+- Hardware and CUDA version
+- Trial count
+- Median and standard deviation
+- Whether the result uses cuBLAS or a custom GEMM backend
+- Correctness tests run on the same build
 
-1. **SIMD Vectorization for Element-Wise Operations** (MEDIUM)
-   - Current implementation uses scalar element-wise loops
-   - Could add SIMD intrinsics (x86 AVX, ARM NEON) for 2-4x speedup on large tensors
-   - Could use compiler auto-vectorization hints (`#pragma omp simd`)
-   - Consider external libraries like xsimd or oneDNN
+## License
 
-2. **In-Place Operations Where Safe** (LOW-MEDIUM)
-   - Current implementation creates new tensors for intermediate results
-   - Could use in-place operations when tensor has single reference
-   - Requires reference counting to track tensor usage
-   - Would reduce memory bandwidth and improve performance
+No license file is currently present in the repository. Add a license before distributing TorchEngine or accepting external contributions.
 
-3. **Broadcasting Gradient Reduction Efficiency** (LOW)
-   - Current `reduce_gradient` sums dimensions one at a time using `Tensor::sum(dim)`
-   - Each sum creates a new tensor allocation
-   - Could implement multi-dimensional sum operation in single pass
-   - Specialize for common broadcast patterns
-
-4. **Kernel Fusion Opportunities** (MEDIUM)
-   - Chain operations like `bias + gelu` into single kernel
-   - Reduces memory traffic and kernel launch overhead
-   - Particularly important for transformer blocks
-
-## Building & Testing
-
-```bash
-cmake -S . -B build
-cmake --build build
-./build/tensor_test      # tensor system + ops (48 tests)
-./build/autograd_test    # autograd + backward engine + broadcasting reduction (43 tests)
-```

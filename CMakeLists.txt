@@ -89,6 +89,9 @@ if(CUDA_FOUND)
     add_executable(gpt_benchmark src/benchmarks/gpt_benchmark.cpp)
     target_link_libraries(gpt_benchmark tensor_lib ${CUDA_LIBRARIES} ${CUDA_cublas_LIBRARY})
 
+    add_executable(gpt_benchmark_gpu src/benchmarks/gpt_benchmark_gpu.cpp)
+    target_link_libraries(gpt_benchmark_gpu tensor_lib ${CUDA_LIBRARIES} ${CUDA_cublas_LIBRARY})
+
     add_executable(cuda_matmul_tensor_test src/tests/cuda_matmul_tensor_test.cpp)
     target_link_libraries(cuda_matmul_tensor_test tensor_lib ${CUDA_LIBRARIES} ${CUDA_cublas_LIBRARY})
 

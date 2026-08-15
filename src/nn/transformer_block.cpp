@@ -67,3 +67,10 @@ void TransformerBlock::zero_grad() {
     norm2_->zero_grad();
     ffn_->zero_grad();
 }
+
+void TransformerBlock::to_cuda() {
+    norm1_->to_cuda();
+    attention_->to_cuda();
+    norm2_->to_cuda();
+    ffn_->to_cuda();
+}

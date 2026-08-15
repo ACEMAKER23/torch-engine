@@ -10,7 +10,8 @@ public:
     Tensor forward(const Tensor& input) override;
     std::vector<Tensor> parameters() override { return {}; }
     void zero_grad() override {}
-    
+    void to_cuda() override;
+
 private:
     int64_t max_seq_len_;
     int64_t d_model_;

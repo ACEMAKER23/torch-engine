@@ -59,3 +59,12 @@ void Linear::zero_grad() {
         bias_.grad()->fill_<float>(0.0f);
     }
 }
+
+void Linear::to_cuda() {
+    bool req_w = weight_.requiredGrad();
+    bool req_b = bias_.requiredGrad();
+    weight_ = weight_.toDevice(Device::CUDA);
+    bias_   = bias_.toDevice(Device::CUDA);
+    weight_.setRequiresGrad(req_w);
+    bias_.setRequiresGrad(req_b);
+}

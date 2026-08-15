@@ -36,3 +36,8 @@ void FeedForward::zero_grad(){
     gelu_->zero_grad();
     linear2_->zero_grad();
 }
+
+void FeedForward::to_cuda() {
+    linear1_->to_cuda();
+    linear2_->to_cuda();
+}

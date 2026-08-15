@@ -1,6 +1,10 @@
 #include "positional_embedding.h"
 #include <vector>
 
+#ifdef USE_CUDA
+#include <cuda_runtime.h>
+#endif
+
 PositionalEmbedding::PositionalEmbedding(int64_t max_seq_len, int64_t d_model, DType dtype)
     : max_seq_len_(max_seq_len), d_model_(d_model), pe_({max_seq_len, d_model}, dtype, Device::CPU) {
     
@@ -35,22 +39,28 @@ Tensor PositionalEmbedding::forward(const Tensor& input) {
     // input shape: [batch, seq_len] or [seq_len]
     // pe shape: [max_seq_len, d_model]
     // Return positional embeddings for the sequence length
-    
+
     int64_t seq_len = input.shape()[input.shape().size() - 1];
-    
+
     // Slice positional embeddings to match sequence length
-    // Create a new tensor with shape [seq_len, d_model]
+    // Create a new tensor with shape [seq_len, d_model] on the same device as pe_
     Tensor sliced_pe({seq_len, d_model_}, pe_.dtype(), pe_.device());
-    
-    auto* src_data = static_cast<float*>(pe_.data());
-    auto* dst_data = static_cast<float*>(sliced_pe.data());
-    
-    // Copy first seq_len rows from pe_
-    for (int64_t pos = 0; pos < seq_len; ++pos) {
-        for (int64_t i = 0; i < d_model_; ++i) {
-            dst_data[pos * d_model_ + i] = src_data[pos * d_model_ + i];
-        }
+
+    size_t bytes = static_cast<size_t>(seq_len * d_model_) * sizeof(float);
+
+    if (pe_.device() == Device::CUDA) {
+#ifdef USE_CUDA
+        cudaMemcpy(sliced_pe.data(), pe_.data(), bytes, cudaMemcpyDeviceToDevice);
+#else
+        throw std::runtime_error("CUDA not available");
+#endif
+    } else {
+        std::memcpy(sliced_pe.data(), pe_.data(), bytes);
     }
-    
+
     return sliced_pe;  // Return [seq_len, d_model]
+}
+
+void PositionalEmbedding::to_cuda() {
+    pe_ = pe_.toDevice(Device::CUDA);
 }

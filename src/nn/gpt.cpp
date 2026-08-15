@@ -1,5 +1,9 @@
 #include "gpt.h"
 
+#ifdef USE_CUDA
+#include <cuda_runtime.h>
+#endif
+
 GPT::GPT(int64_t vocabSize, int64_t maxSeqLen, int64_t embedDim, 
          int64_t numHeads, int64_t numLayers, int64_t ffDim, 
          DType dtype, float dropoutRate)
@@ -35,15 +39,28 @@ Tensor GPT::forward(const Tensor& input) {
     int64_t embed_dim = embedDim_;
     
     Tensor posEmbBroadcast({batch_size, seq_len, embed_dim}, tokenEmb.dtype(), tokenEmb.device());
-    
+
     // Copy positional embeddings for each batch
-    auto* src_data = static_cast<float*>(posEmb.data());
-    auto* dst_data = static_cast<float*>(posEmbBroadcast.data());
-    
-    for (int64_t b = 0; b < batch_size; ++b) {
-        for (int64_t s = 0; s < seq_len; ++s) {
-            for (int64_t e = 0; e < embed_dim; ++e) {
-                dst_data[b * seq_len * embed_dim + s * embed_dim + e] = src_data[s * embed_dim + e];
+    size_t row_bytes = static_cast<size_t>(seq_len * embed_dim) * sizeof(float);
+    if (posEmb.device() == Device::CUDA) {
+#ifdef USE_CUDA
+        auto* dst = static_cast<char*>(posEmbBroadcast.data());
+        const auto* src = static_cast<const char*>(posEmb.data());
+        for (int64_t b = 0; b < batch_size; ++b) {
+            cudaMemcpy(dst + b * row_bytes, src, row_bytes, cudaMemcpyDeviceToDevice);
+        }
+#else
+        throw std::runtime_error("CUDA not available");
+#endif
+    } else {
+        auto* src_data = static_cast<float*>(posEmb.data());
+        auto* dst_data = static_cast<float*>(posEmbBroadcast.data());
+        for (int64_t b = 0; b < batch_size; ++b) {
+            for (int64_t s = 0; s < seq_len; ++s) {
+                for (int64_t e = 0; e < embed_dim; ++e) {
+                    dst_data[b * seq_len * embed_dim + s * embed_dim + e] =
+                        src_data[s * embed_dim + e];
+                }
             }
         }
     }
@@ -106,4 +123,14 @@ void GPT::zero_grad() {
     
     finalNorm_->zero_grad();
     lmHead_->zero_grad();
+}
+
+void GPT::to_cuda() {
+    tokenEmbedding_->to_cuda();
+    posEmbedding_->to_cuda();
+    for (auto& block : blocks_) {
+        block->to_cuda();
+    }
+    finalNorm_->to_cuda();
+    lmHead_->to_cuda();
 }

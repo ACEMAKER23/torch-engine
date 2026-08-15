@@ -13,6 +13,7 @@ public:
     Tensor forward(const Tensor& input) override;
     std::vector<Tensor> parameters() override;
     void zero_grad() override;
+    void to_cuda() override;
 
 private:    
     std::unique_ptr<Linear> linear1_;

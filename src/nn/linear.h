@@ -14,6 +14,7 @@ public:
     
     std::vector<Tensor> parameters() override;
     void zero_grad() override;
+    void to_cuda() override;
 
 private: 
     int64_t inFeatures_;

@@ -104,3 +104,9 @@ std::vector<Tensor> Embedding::parameters() {
 void Embedding::zero_grad() {
     // Gradients are cleared by the tensor implementation during backward
 }
+
+void Embedding::to_cuda() {
+    bool req_w = weight_.requiredGrad();
+    weight_ = weight_.toDevice(Device::CUDA);
+    weight_.setRequiresGrad(req_w);
+}

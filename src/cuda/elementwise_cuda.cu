@@ -3,6 +3,8 @@
 #endif
 #include <cuda_runtime.h>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include "../core/dtype_utils.h"
 #include <mma.h>
 using namespace nvcuda;
@@ -2737,10 +2739,65 @@ void cuda_gelu_backward(const float* input, const float* grad_output,
 // ---------------------------------------------------------------------------
 // Reductions: full sum and sum over a single dimension (up to 8 dimensions).
 // ---------------------------------------------------------------------------
-__global__ void reduce_sum_kernel(const float* input, float* output, int64_t size) {
+/*
+ * Full-tensor reduction kernels.
+ * We keep both implementations so we can A/B them via an env var.
+ * - reduce_sum_atomic_kernel: per-element atomicAdd (fast for tiny tensors).
+ * - reduce_sum_phase1_kernel: grid-stride + shared-memory tree reduction
+ *   (better for large tensors because it avoids contention).
+ */
+__global__ void reduce_sum_atomic_kernel(const float* input, float* output, int64_t size) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     atomicAdd(output, input[idx]);
+}
+
+__global__ void reduce_sum_phase1_kernel(const float* input, float* block_sums,
+                                          int64_t size, int num_blocks) {
+    extern __shared__ float sdata[];
+    int tid = threadIdx.x;
+    int global_idx = blockIdx.x * blockDim.x + tid;
+    int stride = blockDim.x * num_blocks;
+
+    float local_sum = 0.0f;
+    for (int64_t i = global_idx; i < size; i += stride) {
+        local_sum += input[i];
+    }
+
+    sdata[tid] = local_sum;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        block_sums[blockIdx.x] = sdata[0];
+    }
+}
+
+__global__ void reduce_sum_phase2_kernel(const float* block_sums, float* output,
+                                          int num_blocks) {
+    extern __shared__ float sdata[];
+    int tid = threadIdx.x;
+
+    float v = (tid < num_blocks) ? block_sums[tid] : 0.0f;
+    sdata[tid] = v;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        *output = sdata[0];
+    }
 }
 
 __global__ void sum_dim_kernel(const float* input, float* output,
@@ -2778,9 +2835,31 @@ __global__ void sum_dim_kernel(const float* input, float* output,
 }
 
 void cuda_reduce_sum(const float* input, float* output, int64_t size) {
+    if (size <= 0) {
+        cuda_check_error(cudaMemset(output, 0, sizeof(float)), "cuda_reduce_sum zero");
+        return;
+    }
+
     int threads = 256;
-    int blocks = static_cast<int>((size + threads - 1) / threads);
-    reduce_sum_kernel<<<blocks, threads>>>(input, output, size);
+    const char* mode = getenv("TENSOR_REDUCE_MODE");
+    bool use_atomic = false;
+    bool use_tree   = false;
+    if (mode) {
+        if (std::strcmp(mode, "atomic") == 0) use_atomic = true;
+        else if (std::strcmp(mode, "tree") == 0) use_tree = true;
+    }
+
+    // Default/auto uses atomicAdd because the end-to-end GPT benchmark showed
+    // it is as fast or faster than the tree reduction at all tested scales.
+    // TENSOR_REDUCE_MODE=tree forces the tree reduction if needed.
+    if (use_atomic || !use_tree) {
+        int blocks = static_cast<int>((size + threads - 1) / threads);
+        reduce_sum_atomic_kernel<<<blocks, threads>>>(input, output, size);
+    } else {
+        // Single-block tree reduction with grid-stride accumulation.
+        reduce_sum_phase1_kernel<<<1, threads, threads * sizeof(float)>>>(
+            input, output, size, 1);
+    }
 }
 
 void cuda_sum_dim(const float* input, float* output,
@@ -2793,4 +2872,172 @@ void cuda_sum_dim(const float* input, float* output,
                                         in_shape, in_strides,
                                         out_shape, out_strides,
                                         dim, ndim, out_numel, dim_size);
+}
+
+// ---------------------------------------------------------------------------
+// General strided → contiguous gather (used by Tensor::contiguous on CUDA).
+// Supports up to 8 dimensions.
+// ---------------------------------------------------------------------------
+__global__ void gather_strided_kernel(const float* src, float* dst,
+                                       const int64_t* shape,
+                                       const int64_t* strides,
+                                       int64_t ndim,
+                                       int64_t src_offset,
+                                       int64_t numel) {
+    int64_t flat = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (flat >= numel) return;
+
+    int64_t off = src_offset;
+    int64_t temp = flat;
+    for (int64_t d = ndim - 1; d >= 0; --d) {
+        off  += (temp % shape[d]) * strides[d];
+        temp /= shape[d];
+    }
+    dst[flat] = src[off];
+}
+
+__global__ void gather_strided_i32_kernel(const int32_t* src, int32_t* dst,
+                                           const int64_t* shape,
+                                           const int64_t* strides,
+                                           int64_t ndim,
+                                           int64_t src_offset,
+                                           int64_t numel) {
+    int64_t flat = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (flat >= numel) return;
+
+    int64_t off = src_offset;
+    int64_t temp = flat;
+    for (int64_t d = ndim - 1; d >= 0; --d) {
+        off  += (temp % shape[d]) * strides[d];
+        temp /= shape[d];
+    }
+    dst[flat] = src[off];
+}
+
+__global__ void gather_strided_i64_kernel(const int64_t* src, int64_t* dst,
+                                           const int64_t* shape,
+                                           const int64_t* strides,
+                                           int64_t ndim,
+                                           int64_t src_offset,
+                                           int64_t numel) {
+    int64_t flat = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (flat >= numel) return;
+
+    int64_t off = src_offset;
+    int64_t temp = flat;
+    for (int64_t d = ndim - 1; d >= 0; --d) {
+        off  += (temp % shape[d]) * strides[d];
+        temp /= shape[d];
+    }
+    dst[flat] = src[off];
+}
+
+// ---------------------------------------------------------------------------
+// Unary negation.
+// ---------------------------------------------------------------------------
+__global__ void negate_kernel(const float* src, float* dst, int64_t size) {
+    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx < size) dst[idx] = -src[idx];
+}
+void cuda_negate_f32(const float* src, float* dst, int64_t size) {
+    int threads = 256;
+    int blocks  = static_cast<int>((size + threads - 1) / threads);
+    negate_kernel<<<blocks, threads>>>(src, dst, size);
+}
+
+// ---------------------------------------------------------------------------
+// Fused AdamW (decoupled weight decay) in-place on GPU.
+// ---------------------------------------------------------------------------
+__global__ void adamw_kernel(float* params, const float* grads,
+                              float* m, float* v,
+                              float lr, float beta1, float beta2,
+                              float epsilon, float weight_decay,
+                              float bias_corr1, float bias_corr2,
+                              int64_t size) {
+    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+
+    float g  = grads[idx];
+    float p  = params[idx];
+
+    // Decoupled weight decay
+    p *= (1.0f - weight_decay);
+
+    // Update biased first/second moment estimates
+    float mi = beta1 * m[idx] + (1.0f - beta1) * g;
+    float vi = beta2 * v[idx] + (1.0f - beta2) * g * g;
+
+    m[idx] = mi;
+    v[idx] = vi;
+
+    // Bias-corrected moments and parameter update
+    float m_hat = mi / bias_corr1;
+    float v_hat = vi / bias_corr2;
+    params[idx] = p - lr * m_hat / (sqrtf(v_hat) + epsilon);
+}
+
+void cuda_adamw_f32(float* params, const float* grads,
+                    float* m, float* v,
+                    float lr, float beta1, float beta2,
+                    float epsilon, float weight_decay,
+                    int64_t step, int64_t size) {
+    float bias_corr1 = 1.0f - std::pow(beta1, static_cast<float>(step));
+    float bias_corr2 = 1.0f - std::pow(beta2, static_cast<float>(step));
+    int threads = 256;
+    int blocks  = static_cast<int>((size + threads - 1) / threads);
+    adamw_kernel<<<blocks, threads>>>(params, grads, m, v,
+                                       lr, beta1, beta2,
+                                       epsilon, weight_decay,
+                                       bias_corr1, bias_corr2, size);
+}
+
+void cuda_gather_strided_f32(const float* src, float* dst,
+                              const int64_t* shape_h, const int64_t* strides_h,
+                              int64_t ndim, int64_t src_offset, int64_t numel) {
+    int64_t *d_shape = nullptr, *d_strides = nullptr;
+    size_t bytes = static_cast<size_t>(ndim) * sizeof(int64_t);
+    cudaMalloc(&d_shape,   bytes);
+    cudaMalloc(&d_strides, bytes);
+    cudaMemcpy(d_shape,   shape_h,   bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_strides, strides_h, bytes, cudaMemcpyHostToDevice);
+    int threads = 256;
+    int blocks  = static_cast<int>((numel + threads - 1) / threads);
+    gather_strided_kernel<<<blocks, threads>>>(src, dst, d_shape, d_strides,
+                                               ndim, src_offset, numel);
+    cudaFree(d_shape);
+    cudaFree(d_strides);
+}
+
+void cuda_gather_strided_i32(const int32_t* src, int32_t* dst,
+                              const int64_t* shape_h, const int64_t* strides_h,
+                              int64_t ndim, int64_t src_offset, int64_t numel) {
+    int64_t *d_shape = nullptr, *d_strides = nullptr;
+    size_t bytes = static_cast<size_t>(ndim) * sizeof(int64_t);
+    cudaMalloc(&d_shape,   bytes);
+    cudaMalloc(&d_strides, bytes);
+    cudaMemcpy(d_shape,   shape_h,   bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_strides, strides_h, bytes, cudaMemcpyHostToDevice);
+    int threads = 256;
+    int blocks  = static_cast<int>((numel + threads - 1) / threads);
+    gather_strided_i32_kernel<<<blocks, threads>>>(src, dst, d_shape, d_strides,
+                                                   ndim, src_offset, numel);
+    cudaFree(d_shape);
+    cudaFree(d_strides);
+}
+
+void cuda_gather_strided_i64(const int64_t* src, int64_t* dst,
+                              const int64_t* shape_h, const int64_t* strides_h,
+                              int64_t ndim, int64_t src_offset, int64_t numel) {
+    int64_t *d_shape = nullptr, *d_strides = nullptr;
+    size_t bytes = static_cast<size_t>(ndim) * sizeof(int64_t);
+    cudaMalloc(&d_shape,   bytes);
+    cudaMalloc(&d_strides, bytes);
+    cudaMemcpy(d_shape,   shape_h,   bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_strides, strides_h, bytes, cudaMemcpyHostToDevice);
+    int threads = 256;
+    int blocks  = static_cast<int>((numel + threads - 1) / threads);
+    gather_strided_i64_kernel<<<blocks, threads>>>(src, dst, d_shape, d_strides,
+                                                   ndim, src_offset, numel);
+    cudaFree(d_shape);
+    cudaFree(d_strides);
 }

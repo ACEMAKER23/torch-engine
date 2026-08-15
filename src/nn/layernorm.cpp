@@ -131,3 +131,12 @@ void LayerNorm::zero_grad() {
     if (bias_.grad() && bias_.dtype() == DType::Float32)
         bias_.grad()->fill_<float>(0.0f);
 }
+
+void LayerNorm::to_cuda() {
+    bool req_w = weight_.requiredGrad();
+    bool req_b = bias_.requiredGrad();
+    weight_ = weight_.toDevice(Device::CUDA);
+    bias_   = bias_.toDevice(Device::CUDA);
+    weight_.setRequiresGrad(req_w);
+    bias_.setRequiresGrad(req_b);
+}

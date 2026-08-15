@@ -41,9 +41,28 @@ nn_layers_test
 .DS_Store
 
 # Clangd
+.clangd
 .clangd/
 .cache/
+
+# Private working notes (do not commit)
+/DevelopmentTracker.md
+/tensor.md
+/TEST_PLAN.md
+
+# Local build artifacts (do not commit)
+/build_debug/
+
 
 # Testing
 *.gcda
 *.gcno
+
+#benchmark_result
+benchmark_outputs/*
+/gpt_benchmark_gpu_results.json
+
+#pychache
+scripts/__pycache__/*
+
+

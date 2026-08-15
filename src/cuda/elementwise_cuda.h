@@ -64,6 +64,23 @@ void cuda_sum_dim(const float* input, float* output,
                   const int64_t* out_shape, const int64_t* out_strides,
                   int64_t dim, int64_t ndim, int64_t out_numel, int64_t dim_size);
 
+void cuda_negate_f32(const float* src, float* dst, int64_t size);
+void cuda_adamw_f32(float* params, const float* grads,
+                    float* m, float* v,
+                    float lr, float beta1, float beta2,
+                    float epsilon, float weight_decay,
+                    int64_t step, int64_t size);
+
+void cuda_gather_strided_f32(const float*   src, float*   dst,
+                              const int64_t* shape_h, const int64_t* strides_h,
+                              int64_t ndim, int64_t src_offset, int64_t numel);
+void cuda_gather_strided_i32(const int32_t* src, int32_t* dst,
+                              const int64_t* shape_h, const int64_t* strides_h,
+                              int64_t ndim, int64_t src_offset, int64_t numel);
+void cuda_gather_strided_i64(const int64_t* src, int64_t* dst,
+                              const int64_t* shape_h, const int64_t* strides_h,
+                              int64_t ndim, int64_t src_offset, int64_t numel);
+
 void cuda_matmul(const float* A, const float* B, float* C, int M, int K, int N);
 void cuda_matmul_shared_memory(const float* A, const float* B, float* C, int M, int K, int N);
 void cuda_matmul_register_blocking(const float* A, const float* B, float* C, int M, int K, int N);

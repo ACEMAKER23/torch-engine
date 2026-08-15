@@ -6,6 +6,7 @@
 #include <functional>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <stdexcept>
 #include "../core/grad_fn.h"
 
@@ -24,6 +25,7 @@ void cuda_sum_dim(const float* input, float* output,
                   const int64_t* out_shape, const int64_t* out_strides,
                   int64_t dim, int64_t ndim, int64_t out_numel, int64_t dim_size);
 void cuda_negate_f32(const float* src, float* dst, int64_t size);
+void cuda_matmul_double_buffered_cpasync(const float* A, const float* B, float* C, int M, int K, int N);
 void cuda_adamw_f32(float* params, const float* grads,
                     float* m, float* v,
                     float lr, float beta1, float beta2,
@@ -644,6 +646,38 @@ public:
         const float* A_ptr = static_cast<const float*>(a.data()); // our A
         const float* B_ptr = static_cast<const float*>(b.data()); // our B
         float* C_ptr = static_cast<float*>(result.data());
+
+        const bool row_major_a = (s_col_a == 1);
+        const bool row_major_b = (s_col_b == 1);
+        const char* backend_env = std::getenv("TENSOR_GEMM_BACKEND");
+        const bool prefer_custom = backend_env && std::strcmp(backend_env, "custom") == 0;
+
+        auto do_custom_gemm = [&](const float* A_batch, const float* B_batch, float* C_batch) {
+            cuda_matmul_double_buffered_cpasync(A_batch, B_batch, C_batch,
+                                                static_cast<int>(M), static_cast<int>(K), static_cast<int>(N));
+        };
+
+        if (prefer_custom && row_major_a && row_major_b) {
+            if (batch_shape.empty()) {
+                do_custom_gemm(A_ptr, B_ptr, C_ptr);
+            } else {
+                size_t num_batches = 1;
+                for (int64_t dim : batch_shape) num_batches *= dim;
+                std::vector<int64_t> batch_indices_multi(batch_shape.size());
+                for (size_t batch_idx = 0; batch_idx < num_batches; ++batch_idx) {
+                    size_t temp_idx = batch_idx;
+                    for (int i = (int)batch_shape.size() - 1; i >= 0; --i) {
+                        batch_indices_multi[i] = temp_idx % batch_shape[i];
+                        temp_idx /= batch_shape[i];
+                    }
+                    size_t offset_a = compute_batch_offset(a, batch_indices_multi);
+                    size_t offset_b = compute_batch_offset(b, batch_indices_multi);
+                    size_t offset_result = compute_batch_offset(result, batch_indices_multi);
+                    do_custom_gemm(A_ptr + offset_a, B_ptr + offset_b, C_ptr + offset_result);
+                }
+            }
+            return;
+        }
 
         const float alpha = 1.0f;
         const float beta = 0.0f;

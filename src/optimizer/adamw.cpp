@@ -1,6 +1,11 @@
 #include "adamw.h"
 #include "../tensor/tensor.h"
 
+#ifdef USE_CUDA
+#include <cuda_runtime.h>
+#include "../core/cuda_utils.h"
+#endif
+
 adamw::adamw(const std::vector<Tensor>& parameters, float beta1, float beta2, float epsilon, float weight_decay)
     : optimizer(parameters), beta1_(beta1), beta2_(beta2), epsilon_(epsilon), weight_decay_(weight_decay), step_(0) {
     
@@ -30,6 +35,22 @@ void adamw::step(float learningRate) {
         if (!param.requiredGrad() || !param.grad()) continue;
 
         size_t N = param.numel();
+
+#ifdef USE_CUDA
+        if (param.device() == Device::CUDA) {
+            // Fused in-place AdamW update on GPU.
+            cuda_adamw_f32(static_cast<float*>(param.data()),
+                           static_cast<const float*>(param.grad()->data()),
+                           static_cast<float*>(m.data()),
+                           static_cast<float*>(v.data()),
+                           learningRate, beta1_, beta2_,
+                           epsilon_, weight_decay_,
+                           step_, static_cast<int64_t>(N));
+            cuda_check_error(cudaGetLastError(), "cuda_adamw_f32 failed");
+            continue;
+        }
+#endif
+
         auto*       p_data = static_cast<float*>(param.data());
         auto*       m_data = static_cast<float*>(m.data());
         auto*       v_data = static_cast<float*>(v.data());
