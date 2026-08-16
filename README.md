@@ -1,4 +1,4 @@
-﻿# TorchEngine
+#                                                    TorchEngine
 
 > A C++17/CUDA deep learning framework inspired by PyTorch, built to expose and optimize the implementation details behind tensors, autograd, neural network layers, transformer models, and GPU kernels.
 
@@ -79,7 +79,7 @@ Autograd metadata lives in the shared `TensorImpl`, not only in the lightweight 
 
 ## CUDA & Performance
 
-CUDA support is enabled when CMake finds CUDA. The build defines `USE_CUDA`, compiles `src/cuda/elementwise_cuda.cu`, enables CUDA language support, and links CUDA/cuBLAS libraries.
+CUDA is optional at the CMake configuration level, but the current test suite and several headers depend on CUDA runtime headers. A CUDA Toolkit installation is therefore recommended for the complete build and test workflow.
 
 ### Implemented CUDA Paths
 
@@ -215,7 +215,7 @@ cd build
 ctest --output-on-failure
 ```
 
-The CMake test suite currently registers the core tests and the general CUDA test target. Additional CUDA-specific test executables are built when CUDA is available and can be run directly:
+The CMake test suite currently registers the core tests. When CUDA is enabled, it also registers a CUDA smoke test (and builds additional CUDA-specific test executables). Additional CUDA-specific test executables are built when CUDA is available and can be run directly:
 
 ```bash
 ./build/cuda_matmul_tensor_test
@@ -371,9 +371,9 @@ For methodology and interpretation rules, see [BENCHMARKING.md](BENCHMARKING.md)
 |-- CMakeLists.txt
 |-- BENCHMARKING.md
 |-- TEST_PLAN.md
-|-- tensor.md
 |-- data/
 |   `-- tinyshakespeare.txt
+|-- .github/       # Issue + PR templates
 |-- scripts/
 |   |-- run_benchmark_suite.py
 |   |-- benchmark_pytorch_gpt.py
@@ -391,6 +391,8 @@ For methodology and interpretation rules, see [BENCHMARKING.md](BENCHMARKING.md)
 ```
 
 ## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 Contributions should preserve the repository's focus: correctness first, measurements before performance claims, and clear separation between implemented features and experiments.
 
@@ -412,7 +414,4 @@ For performance-related changes, include:
 - Whether the result uses cuBLAS or a custom GEMM backend
 - Correctness tests run on the same build
 
-## License
-
-No license file is currently present in the repository. Add a license before distributing TorchEngine or accepting external contributions.
 

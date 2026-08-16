@@ -1,5 +1,7 @@
 # Benchmarking Guide
 
+Note: the repository is named **TorchEngine**, but some binaries, environment variables, and CMake identifiers still use the legacy project name TENSOR. This document uses TENSOR where it matches the current code/scripts.
+
 This repository uses a consistent benchmark suite for two questions:
 
 1. End-to-end GPT training throughput: TENSOR CPU vs PyTorch CPU, and TENSOR GPU vs PyTorch GPU, across multiple model sizes.
